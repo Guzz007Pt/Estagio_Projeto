@@ -1,4 +1,4 @@
-# Pipeline Meteo (IPMA → PostgreSQL) — 1ª Iteração
+# Pipeline Meteo (IPMA → PostgreSQL) — 1ª Iteração V1.0
 
 Pipeline simples (prova de conceito) para:
 
