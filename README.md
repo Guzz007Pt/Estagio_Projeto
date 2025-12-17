@@ -61,7 +61,7 @@ pip install requests psycopg2-binary tabulate
 
 ### API
 
-Por omissão, usa:
+Por omissão, usa-se:
 
 - `API_URL = https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json`
 
@@ -89,7 +89,7 @@ O envio usa SMTP em `localhost`:
 - `EMAIL_FROM`
 - `EMAIL_TO`
 
-Se não tiveres SMTP local (ex: Render/Cloud), vais precisar de:
+Se não tiver SMTP local (ex: Render/Cloud), vai ser preciso:
 
 - SMTP externo (host/porta/auth), ou
 - desactivar email no ambiente de dev
@@ -152,7 +152,7 @@ A tabela alvo do logbook chama-se **`ipma_obs`**. Campos principais (resumo):
 
 ### Mapeamento (observations.json -> ipma_obs)
 
-Campos típicos que já tens no parsing (ou que são directos):
+Campos típicos que já estão no parsing (ou que são directos):
 
 - `fonte` -> `"IPMA"`
 - `time` -> `timestamp` (chave do JSON)
@@ -171,11 +171,11 @@ Campos que **não vêm** no JSON de observações (na baseline) e exigem enrique
 - `localestacao`, `latitude`, `longitude`
 - `descdirvento` (pode ser derivado a partir de `iddireccvento`)
 
-> **Nota importante (baseline):** o teu script actual ainda aponta a inserção para a tabela `meteo` e usa chaves como `lugar/lat/lon`. Uma iteração seguinte deve alinhar a query e o parsing com `ipma_obs`.
+> **Nota importante (baseline):** o script actual ainda aponta a inserção para a tabela `meteo` e usa chaves como `lugar/lat/lon`. Uma iteração seguinte deveria alinhar a query e o parsing com `ipma_obs`.
 
 ### Query sugerida (para alinhar com ipma_obs)
 
-Quando fores alinhar o código com `ipma_obs`, a inserção pode ser nesta forma:
+Quando se alinhar o código com `ipma_obs`, a inserção pode ser nesta forma:
 
 ```sql
 INSERT INTO ipma_obs (
@@ -198,7 +198,7 @@ VALUES (
 
 ## Funcoes (API interna)
 
-> Dica: nesta 1ª iteração, documentamos “o que existe”. Nas iterações seguintes, actualizas esta secção com as mudanças e o racional.
+> Dica: nesta 1ª iteração, documentou-se “o que existe”. Nas iterações seguintes, irá ser atualizada esta secção com as mudanças e o racional.
 
 ### `request_data(api_url)`
 
@@ -264,7 +264,7 @@ VALUES (
 - **Credenciais no código**
   - Devem passar para env vars/secrets para permitir portabilidade e partilha segura.
 - **Sem idempotencia / deduplicacao**
-  - Se correres várias vezes, podes inserir duplicados (futuro: `ON CONFLICT`, chaves naturais, etc.).
+  - Se correr várias vezes, podes inserir duplicados (futuro: `ON CONFLICT`, chaves naturais, etc.).
 - **Dependencia de SMTP local**
   - Em cloud, `localhost` pode não ter SMTP.
 
