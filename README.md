@@ -112,13 +112,13 @@ O `__main__` inicia por defeito:
 
 ```mermaid
 flowchart LR
-  A[Request API] --> B[Recepcao/Validacao JSON]
-  B --> C[Parsing JSON -> lista de registos]
-  C --> D[Ligacao BD]
-  D --> E[Preparacao da query]
-  E --> F[Execucao da query (executemany + commit)]
-  F --> G[Fecho da ligacao]
-  G --> H[Email com sumario + print da tabela]
+  A["Request API"] --> B["Recepcao/Validacao JSON"]
+  B --> C["Parsing JSON → lista de registos"]
+  C --> D["Ligacao BD"]
+  D --> E["Preparacao da query"]
+  E --> F["Execucao da query (executemany e commit)"]
+  F --> G["Fecho da ligacao"]
+  G --> H["Email com sumario + print da tabela"]
 ```
 
 As métricas por etapa (tempo em segundos) são guardadas num `summary` com o formato:
