@@ -37,6 +37,10 @@ No fim, em ambos os casos:
 - envia um email com o resumo em HTML
 
 ---
+## Iteração v0.1.2 — Mudança de API (Weatherbit) e ajuste de query
+
+Nesta iteração, a fonte de dados foi alterada de IPMA para **Weatherbit (Current Weather API)**.
+O parsing foi adaptado ao novo formato de resposta (`data[]`), passando a recolher campos como cidade, país, sensação térmica, UV, radiação solar, nebulosidade e condição meteorológica.
 
 ## Requisitos
 
@@ -58,11 +62,12 @@ pip install requests psycopg2-binary tabulate
 
 ## Configuracao
 
-### API
+Mudança para WeatherBit API.
+A chave da API deve ser fornecida por variáveis de ambiente (não hardcoded no código):
 
-Por omissão, usa-se:
+- `WEATHERBIT_API_KEY`
+- `WEATHERBIT_CITY` (ex: `Maia,PT`)
 
-- `API_URL = https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json`
 
 ### Base de dados
 
@@ -155,48 +160,54 @@ A tabela alvo do logbook chama-se **`ipma_obs`**. Campos principais (resumo):
 | `latitude` | real |
 | `longitude` | real |
 
-### Mapeamento (observations.json -> ipma_obs)
+### Mapeamento (Weatherbit Current -> parsed_data)
 
-Campos típicos que já estão no parsing (ou que são directos):
+Campos extraídos do Weatherbit (`data[]`) e normalizados em `parsed_data`:
 
-- `fonte` -> `"IPMA"`
-- `time` -> `timestamp` (chave do JSON)
-- `idestacao` -> `station_id`
-- `intensidadevento` -> `intensidadeVento`
-- `intensidadeventokm` -> `intensidadeVentoKM`
-- `temperatura` -> `temperatura`
-- `pressao` -> `pressao`
-- `humidade` -> `humidade`
-- `precacumulada` -> `precAcumulada`
-- `iddireccvento` -> `idDireccVento`
-- `radiacao` -> `radiacao`
+- `fonte` -> `"Weatherbit"`
+- `data` -> `ob_time`
+- `cidade` -> `city_name`
+- `pais` -> `country_code`
+- `temp` -> `temp`
+- `sensacao_termica` -> `app_temp`
+- `humidade` -> `rh`
+- `vento` -> `wind_spd`
+- `vento_dir` -> `wind_dir`
+- `vento_desc` -> `wind_cdir_full`
+- `pressao` -> `pres`
+- `precipitacao` -> `precip`
+- `uv` -> `uv`
+- `radiacao_solar` -> `solar_rad`
+- `nuvens` -> `clouds`
+- `condicao` -> `weather.description`
+- `estacao` -> `station`
+- `nascer_sol` -> `sunrise`
+- `por_sol` -> `sunset`
+- `lat` -> `lat`
+- `lon` -> `lon`
 
-Campos que **não vêm** no JSON de observações (na baseline) e exigem enriquecimento:
+> Nota: o mapeamento antigo (IPMA / `ipma_obs`) está preservado nos snapshots em `docs/iterations/v0.1/`.
 
-- `localestacao`, `latitude`, `longitude`
-- `descdirvento` (pode ser derivado a partir de `iddireccvento`)
 
-> **Nota importante (baseline):** o script actual ainda aponta a inserção para a tabela `meteo` e usa chaves como `lugar/lat/lon`. Uma iteração seguinte deveria alinhar a query e o parsing com `ipma_obs`.
 
-### Query sugerida (para alinhar com ipma_obs)
+### Query (referência para modo online)
 
-Quando se alinhar o código com `ipma_obs`, a inserção pode ser nesta forma:
+Mesmo em modo offline (CSV), a query fica definida como referência para quando o modo BD voltar.
 
 ```sql
-INSERT INTO ipma_obs (
-  fonte, time, idestacao,
-  intensidadeventokm, intensidadevento,
-  temperatura, pressao, humidade, precacumulada,
-  iddireccvento, radiacao,
-  localestacao, descdirvento, latitude, longitude
+INSERT INTO meteo (
+  fonte, data, lugar, lat, lon,
+  temp, humidade, vento, pressao, precipitacao,
+  uv, radiacao_solar, nuvens, condicao,
+  vento_dir, vento_desc, sensacao_termica, pais, estacao, nascer_sol, por_sol
 )
 VALUES (
-  %(fonte)s, %(time)s, %(idestacao)s,
-  %(intensidadeventokm)s, %(intensidadevento)s,
-  %(temperatura)s, %(pressao)s, %(humidade)s, %(precacumulada)s,
-  %(iddireccvento)s, %(radiacao)s,
-  %(localestacao)s, %(descdirvento)s, %(latitude)s, %(longitude)s
+  %(fonte)s, %(data)s, %(lugar)s, %(lat)s, %(lon)s,
+  %(temp)s, %(humidade)s, %(vento)s, %(pressao)s, %(precipitacao)s,
+  %(uv)s, %(radiacao_solar)s, %(nuvens)s, %(condicao)s,
+  %(vento_dir)s, %(vento_desc)s, %(sensacao_termica)s, %(pais)s, %(estacao)s, %(nascer_sol)s, %(por_sol)s
 );
+
 ```
 
 ---

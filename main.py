@@ -20,7 +20,11 @@ DB_CONFIG = {
     "sslmode": os.getenv("DB_SSLMODE", "require"),
 }
 
-API_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
+WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY")
+WEATHERBIT_CITY = os.getenv("WEATHERBIT_CITY", "Maia,PT")
+API_URL = f"https://api.weatherbit.io/v2.0/current?city={WEATHERBIT_CITY}&key={WEATHERBIT_KEY}"
+
+
 
 EMAIL_FROM = "estagio.pipeline@example.com"
 EMAIL_TO = ["pedro.pimenta@cm-maia.pt", "gustavo.sa.martins@gmail.com"]
@@ -43,27 +47,30 @@ def parse_data(json_data):
     start = time.time()
     parsed = []
 
-    for timestamp, stations in json_data.items():
-        if not isinstance(stations, dict):
-            continue
-
-        for station_id, values in stations.items():
-            if not isinstance(values, dict):
-                continue
-
-            parsed.append({
-                "fonte": "IPMA",
-                "data": timestamp,
-                "temp": values.get("temperatura"),
-                "humidade": values.get("humidade"),
-                "vento": values.get("intensidadeVento"),
-                "vento_km": values.get("intensidadeVentoKM"),
-                "pressao": values.get("pressao"),
-                "precipitacao": values.get("precAcumulada"),
-                "radiacao": values.get("radiacao"),
-                "id_estacao": station_id,
-                "id_direcc_vento": values.get("idDireccVento")
-            })
+    for item in json_data.get("data", []):
+        parsed.append({
+            "fonte": "Weatherbit",
+            "data": item.get("ob_time"),
+            "cidade": item.get("city_name"),
+            "pais": item.get("country_code"),
+            "temp": item.get("temp"),
+            "sensacao_termica": item.get("app_temp"),
+            "humidade": item.get("rh"),
+            "vento": item.get("wind_spd"),
+            "vento_dir": item.get("wind_dir"),
+            "vento_desc": item.get("wind_cdir_full"),
+            "pressao": item.get("pres"),
+            "precipitacao": item.get("precip"),
+            "uv": item.get("uv"),
+            "radiacao_solar": item.get("solar_rad"),
+            "nuvens": item.get("clouds"),
+            "condicao": item.get("weather", {}).get("description"),
+            "estacao": item.get("station"),
+            "nascer_sol": item.get("sunrise"),
+            "por_sol": item.get("sunset"),
+            "lat": item.get("lat"),
+            "lon": item.get("lon")
+        })
 
     elapsed = round(time.time() - start, 2)
     return parsed, elapsed
