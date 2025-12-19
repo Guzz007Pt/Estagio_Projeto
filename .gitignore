@@ -1,8 +1,56 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
 
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Runtime outputs (generated)
+# =========================
+offline_output/
+*.log
+
+# If you generate CSVs outside docs, ignore them by default
+*.csv
+
+# BUT keep any sample CSVs you intentionally store in docs/
+!docs/**/*.csv
+
+# =========================
+# Environment / secrets
+# =========================
 .env
 .env.*
-.venv/
-offline_output/
-__pycache__/
-*.pyc
+*.pem
+*.key
 
+# =========================
+# IDE / OS files
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Optional: if you don't want to version run outputs
+# =========================
+# If you DO want to commit docs/iterations/**/run_output.txt as evidence, leave this commented.
+# docs/iterations/**/run_output*.txt
