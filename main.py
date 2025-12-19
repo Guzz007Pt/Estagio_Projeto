@@ -6,6 +6,7 @@ from tabulate import tabulate
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import pandas as pd
 from dotenv import load_dotenv
 load_dotenv()
 import os
@@ -69,9 +70,9 @@ def parse_data(json_data):
 
 def connect_db():
     start = time.time()
-    conn = psycopg2.connect(**DB_CONFIG)
+    print("Ligação offline simulada — base de dados não utilizada.")
     elapsed = round(time.time() - start, 2)
-    return conn, elapsed
+    return None, elapsed
 
 def prepare_query(parsed_data):
     start = time.time()
@@ -82,17 +83,19 @@ def prepare_query(parsed_data):
     elapsed = round(time.time() - start, 2)
     return query, elapsed
 
-def execute_query(conn, query, parsed_data):
+def execute_query(_, __, parsed_data):
     start = time.time()
-    with conn.cursor() as cur:
-        cur.executemany(query, parsed_data)
-        conn.commit()
+    df = pd.DataFrame(parsed_data)
+    os.makedirs("offline_output", exist_ok=True)
+    file_path = f"offline_output/meteo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    df.to_csv(file_path, index=False)
     elapsed = round(time.time() - start, 2)
+    print(f"Dados guardados offline em: {file_path}")
     return elapsed
 
-def close_connection(conn):
+def close_connection(_):
     start = time.time()
-    conn.close()
+    print("Fecho de ligação offline — nada a fechar.")
     elapsed = round(time.time() - start, 2)
     return elapsed
 
