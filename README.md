@@ -1,11 +1,10 @@
-# Pipeline Meteo (IPMA → PostgreSQL) — 1ª Iteração v0.1.2
+# Pipeline Meteo (WeatherBit → PostgreSQL/CSV) — v0.2.0 (context-aware)
 
-Pipeline simples (prova de conceito) para:
-
-1. Recolher observações meteorológicas do **IPMA** (REST API)
-2. Transformar o JSON para registos normalizados
-3. Inserir numa base de dados **PostgreSQL** (ou compatível)
-4. Enviar um **email com sumário** (tempos por etapa + OK/FAIL)
+Pipeline para:
+1. Recolher observações meteorológicas (por defeito: WeatherBit)
+2. Transformar JSON → registos normalizados
+3. Persistir em PostgreSQL (online) ou CSV (offline)
+4. Enviar email com sumário (tempos por etapa + OK/FAIL)
 
 ---
 
@@ -37,20 +36,24 @@ No fim, em ambos os casos:
 - envia um email com o resumo em HTML
 
 ---
-## Iteração v0.1.2 — Mudança de API (Weatherbit) e ajuste de query
+## Iterações / Progressão
 
-Nesta iteração, a fonte de dados foi alterada de IPMA para **Weatherbit (Current Weather API)**.
-O parsing foi adaptado ao novo formato de resposta (`data[]`), passando a recolher campos como cidade, país, sensação térmica, UV, radiação solar, nebulosidade e condição meteorológica.
+- v0.1 — baseline IPMA → `docs/iterations/v0.1/`
+- v0.1.1 — modo offline (CSV) → `docs/iterations/v0.1.1/`
+- v0.1.2 — Weatherbit + query → `docs/iterations/v0.1.2/`
+- v0.2.0 — context-aware + online/offline automático → `docs/iterations/v0.2.0/`
+
 
 ## Requisitos
 
-- Python 3.10+ (recomendado)
+- Python 3.10+
 - Dependências:
   - `requests`
-  - `psycopg2` (ou `psycopg2-binary`)
+  - `psycopg2-binary`
   - `tabulate`
-- Acesso a uma base de dados PostgreSQL (ou compatível)
-- Um servidor SMTP acessível em `localhost` (ou ajustar para SMTP externo)
+  - `python-dotenv`
+  - `pandas`
+
 
 Instalação:
 
@@ -60,13 +63,29 @@ pip install requests psycopg2-binary tabulate
 
 ---
 
-## Configuracao
+## Configuracao (context-aware)
 
-Mudança para WeatherBit API.
-A chave da API deve ser fornecida por variáveis de ambiente (não hardcoded no código):
+A pipeline lê configuração via variáveis de ambiente (recomendado: `.env` local).
 
-- `WEATHERBIT_API_KEY`
-- `WEATHERBIT_CITY` (ex: `Maia,PT`)
+### Pipeline
+- `PIPELINE_USER` (default: `gustavo`)
+- `PIPELINE_ENV` (default: `local`)
+- `PIPELINE_NAME` (default: `GM-IPMA-METEO`)
+- `PIPELINE_API_URL_IPMA` (default: IPMA observations)
+- `PIPELINE_EMAIL_FROM`
+- `PIPELINE_EMAIL_TO` (emails separados por vírgula)
+- `PIPELINE_DASHBOARD_URL_METEO` (opcional)
+
+### Base de dados (modo online)
+- `DB_MAIN_HOST`
+- `DB_MAIN_PORT`
+- `DB_MAIN_NAME`
+- `DB_MAIN_USER`
+- `DB_MAIN_PASSWORD`
+- `DB_MAIN_SSLMODE`
+
+> Modo offline: se `DB_MAIN_HOST` estiver vazio (ou começar por "Nao..."), a pipeline não liga à BD e guarda CSV em `offline_output/`.
+
 
 
 ### Base de dados
