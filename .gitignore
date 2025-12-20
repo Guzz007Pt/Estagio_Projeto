@@ -35,6 +35,7 @@ offline_output/
 .env.*
 *.pem
 *.key
+.json
 
 # =========================
 # IDE / OS files
