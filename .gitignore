@@ -35,7 +35,7 @@ offline_output/
 .env.*
 *.pem
 *.key
-.json
+db_targets.json
 
 # =========================
 # IDE / OS files
