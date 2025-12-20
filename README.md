@@ -100,12 +100,12 @@ source .venv/bin/activate
 ```
 
 ### 2) Instalar dependências
-Se tiveres `requirements.txt`:
+Se tiver `requirements.txt`:
 ```bash
 pip install -r requirements.txt
 ```
 
-Se não tiveres:
+Se não existir:
 ```bash
 pip install requests psycopg2-binary python-dotenv pandas clts-pcp tabulate
 ```
@@ -138,8 +138,6 @@ PIPELINE_DASHBOARD_URL_METEO=
 PIPELINE_DB_TARGETS_FILE=db_targets.json
 ```
 
-> **Recomendação:** não comitar `.env` (adiciona ao `.gitignore`) e criar um `.env.example` com placeholders.
-
 ---
 
 ### Ficheiro `db_targets.json`
@@ -148,7 +146,6 @@ A v0.3 suporta targets no formato:
 - uma lista `[...]`, ou
 - um objeto `{ "targets": [...] }`
 
-Exemplo recomendado (**não comitar com passwords**; cria um `db_targets.example.json` e ignora `db_targets.json`):
 
 ```json
 {
@@ -252,7 +249,7 @@ Se for duplicado, o registo é ignorado (idempotência básica por re-run).
 
 ## Schema mínimo recomendado
 
-Se precisares de criar rapidamente uma tabela compatível com a v0.3 (mínimo):
+Se precisar de criar rapidamente uma tabela compatível com a v0.3 (mínimo):
 
 ```sql
 CREATE TABLE IF NOT EXISTS meteo (
@@ -288,23 +285,6 @@ A pipeline normaliza várias fontes para um formato comum (mínimo):
 | `precipitacao` | precipitação | pode vir `None` |
 | `lugar` | identificador lógico | no IPMA pode ser `station_id` (para dedup) |
 | `lat/lon` | coordenadas | nem sempre disponíveis |
-
----
-
-## Snapshots e evidências
-
-Para esta iteração (v0.3), recomenda-se manter em `docs/iterations/v0.3/`:
-
-- `notes.md` — o que mudou e porquê
-- `mapping.md` — mapeamento fonte → normalizado → BD
-- `evidence/` — prints e outputs (execução, email recebido, prova na BD, etc.)
-- `code.diff` — diff desta iteração (ex. v0.2 → v0.3)
-
-Sugestões de “prints”/provas:
-- console output da execução (com passos e resultados),
-- print do CSV gerado em `offline_output/` (quando aplicável),
-- print do email recebido,
-- print do resultado da BD (ex. `SELECT COUNT(*) FROM meteo;` e um `SELECT * ORDER BY regdata DESC LIMIT 5;`).
 
 ---
 
