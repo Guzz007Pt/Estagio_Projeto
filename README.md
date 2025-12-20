@@ -28,7 +28,6 @@ A versão **v0.3** representa o primeiro salto “grande” para uma execução 
 - [Deduplicação](#deduplicação)
 - [Schema mínimo recomendado](#schema-mínimo-recomendado)
 - [Mapeamento de dados](#mapeamento-de-dados)
-- [Snapshots e evidências](#snapshots-e-evidências)
 - [Próximos passos](#próximos-passos)
 
 ---
