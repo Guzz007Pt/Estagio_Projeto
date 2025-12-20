@@ -1,48 +1,64 @@
-# Pipeline Meteo (WeatherBit → PostgreSQL/CSV) — v0.2.0 (context-aware)
+# Pipeline Meteo (Weatherbit/IPMA → PostgreSQL multi-target / CSV) — v0.3
 
 Pipeline para:
-1. Recolher observações meteorológicas (por defeito: WeatherBit)
-2. Transformar JSON → registos normalizados
-3. Persistir em PostgreSQL (online) ou CSV (offline)
-4. Enviar email com sumário (tempos por etapa + OK/FAIL)
+1. Recolher observações meteorológicas (**Weatherbit** ou **IPMA**)
+2. Transformar JSON → registos normalizados (`parsed_data`)
+3. Persistir em **PostgreSQL** (modo online, com **fail-safe multi-DB**) ou em **CSV** (modo offline)
+4. Evitar duplicados (checker SQL)
+5. Enviar email com sumário (tempos por etapa + OK/FAIL) e, quando disponível, tabela HTML com métricas
 
 ---
 
-## Indice
+## Índice
 
-- [Visao geral](#visao-geral)
+- [Visão geral](#visão-geral)
+- [Iterações e progressão](#iterações-e-progressão)
 - [Requisitos](#requisitos)
-- [Configuracao](#configuracao)
+- [Configuração](#configuração)
+  - [Variáveis de ambiente](#variáveis-de-ambiente)
+  - [db_targets.json](#db_targetsjson)
+  - [Email](#email)
 - [Como executar](#como-executar)
-- [Modo offline](#modo-offline-sem-base-de-dados)
+- [Modo offline](#modo-offline)
 - [Fluxo da pipeline](#fluxo-da-pipeline)
-- [Tabela alvo ipma obs](#tabela-alvo-ipma-obs)
-- [Funcoes (API interna)](#funcoes-api-interna)
-- [Limitacoes conhecidas (baseline)](#limitacoes-conhecidas-baseline)
-- [Proximos passos](#proximos-passos)
+- [Tabela alvo e modelo de dados](#tabela-alvo-e-modelo-de-dados)
+  - [Registo normalizado](#registo-normalizado)
+  - [Mapeamento Weatherbit](#mapeamento-weatherbit)
+  - [Mapeamento IPMA](#mapeamento-ipma)
+- [Deduplicação](#deduplicação)
+- [Funções principais](#funções-principais)
+- [Limitações conhecidas](#limitações-conhecidas)
+- [Próximos passos](#próximos-passos)
 
 ---
 
-## Visao geral
+## Visão geral
 
-O script implementa duas variantes:
+A v0.3 introduz melhorias de robustez e rastreabilidade:
 
-- **`pipeline_meteo_normal()`**: faz primeiro o pedido à API e só depois liga à BD.
-- **`pipeline_meteo_heavy()`**: liga à BD primeiro e só depois chama a API (útil para comparar comportamento/tempos).
-
-No fim, em ambos os casos:
-
-- imprime a tabela de execução no terminal
-- envia um email com o resumo em HTML
+- **API dual (Weatherbit / IPMA)**  
+  - Weatherbit quando existe `WEATHERBIT_API_KEY`
+  - IPMA como fallback
+- **Persistência online com fail-safe multi-DB**  
+  - tenta ligar a múltiplas bases de dados e insere nas que estiverem disponíveis
+- **Persistência offline (CSV)**  
+  - se nenhuma BD estiver disponível, grava CSV em `offline_output/`
+- **Deduplicação**  
+  - antes de inserir, corre um “checker SQL” para evitar duplicados por chave lógica
+- **Email de sumário**  
+  - tabela HTML com estados/tempos por etapa (se SMTP estiver configurado)
 
 ---
-## Iterações / Progressão
+
+## Iterações e progressão
 
 - v0.1 — baseline IPMA → `docs/iterations/v0.1/`
 - v0.1.1 — modo offline (CSV) → `docs/iterations/v0.1.1/`
-- v0.1.2 — Weatherbit + query → `docs/iterations/v0.1.2/`
+- v0.1.2 — mudança de API + ajuste de query → `docs/iterations/v0.1.2/`
 - v0.2.0 — context-aware + online/offline automático → `docs/iterations/v0.2.0/`
+- **v0.3 — API dual + multi-DB fail-safe + deduplicação + email/monitor** → `docs/iterations/v0.3/`
 
+---
 
 ## Requisitos
 
@@ -54,261 +70,286 @@ No fim, em ambos os casos:
   - `python-dotenv`
   - `pandas`
 
-
-Instalação:
-
-```bash
-pip install requests psycopg2-binary tabulate
-```
-
----
-
-## Configuracao (context-aware)
-
-A pipeline lê configuração via variáveis de ambiente (recomendado: `.env` local).
-
-### Pipeline
-- `PIPELINE_USER` (default: `gustavo`)
-- `PIPELINE_ENV` (default: `local`)
-- `PIPELINE_NAME` (default: `GM-IPMA-METEO`)
-- `PIPELINE_API_URL_IPMA` (default: IPMA observations)
-- `PIPELINE_EMAIL_FROM`
-- `PIPELINE_EMAIL_TO` (emails separados por vírgula)
-- `PIPELINE_DASHBOARD_URL_METEO` (opcional)
-
-### Base de dados (modo online)
-- `DB_MAIN_HOST`
-- `DB_MAIN_PORT`
-- `DB_MAIN_NAME`
-- `DB_MAIN_USER`
-- `DB_MAIN_PASSWORD`
-- `DB_MAIN_SSLMODE`
-
-> Modo offline: se `DB_MAIN_HOST` estiver vazio (ou começar por "Nao..."), a pipeline não liga à BD e guarda CSV em `offline_output/`.
-
-
-
-### Base de dados
-
-A ligação é feita via `DB_CONFIG`.
-
-**Boa prática:** não guardar credenciais no repositório. Em iterações seguintes, mover para **variáveis de ambiente / secrets**.
-
-Exemplo (recomendado):
+Instalação (mínimo):
 
 ```bash
-export DB_NAME="..."
-export DB_USER="..."
-export DB_PASSWORD="..."
-export DB_HOST="..."
-export DB_PORT="26257"
-export DB_SSLMODE="require"
-```
+pip install requests psycopg2-binary tabulate python-dotenv pandas
 
-### Email
+Configuração
+Variáveis de ambiente
 
-O envio usa SMTP em `localhost`:
+Recomendado: usar .env local (não commitar). Mantém um .env.example no repo.
 
-- `EMAIL_FROM`
-- `EMAIL_TO`
+Pipeline
 
-Se não tiver SMTP local (ex: Render/Cloud), vai ser preciso:
+    PIPELINE_NAME (ex: GM-METEO)
 
-- SMTP externo (host/porta/auth), ou
-- desactivar email no ambiente de dev
+    PIPELINE_ENV (ex: local, dev, prod)
 
----
+    PIPELINE_USER (ex: gustavo)
 
-## Como executar
+    PIPELINE_API_URL (opcional: força o endpoint)
 
-```bash
+    PIPELINE_API_URL_IPMA (opcional: força IPMA)
+
+    PIPELINE_DASHBOARD_URL_METEO (opcional)
+
+Weatherbit
+
+    WEATHERBIT_API_KEY
+
+    WEATHERBIT_CITY (ex: Maia,PT)
+
+Fallback DB por env (se não existir db_targets.json)
+
+    DB_HOST
+
+    DB_PORT
+
+    DB_NAME
+
+    DB_USER
+
+    DB_PASSWORD
+
+    DB_SSLMODE (ex: require)
+
+    Boas práticas: nunca commitar .env.
+
+db_targets.json
+
+A v0.3 pode usar múltiplos targets (fail-safe). Em vez de uma BD só, defines uma lista de targets.
+
+Importante: db_targets.json não deve ser commitado (contém segredos).
+
+    adiciona ao .gitignore: db_targets.json
+
+    versiona apenas um db_targets.example.json
+
+Exemplo (db_targets.example.json):
+
+{
+  "targets": [
+    {
+      "name": "db_main",
+      "host": "HOST_AQUI",
+      "port": 26257,
+      "dbname": "DB_AQUI",
+      "user": "USER_AQUI",
+      "password": "PASSWORD_AQUI",
+      "sslmode": "require"
+    },
+    {
+      "name": "db_backup",
+      "host": "HOST_BACKUP_AQUI",
+      "port": 26257,
+      "dbname": "DB_BACKUP_AQUI",
+      "user": "USER_AQUI",
+      "password": "PASSWORD_AQUI",
+      "sslmode": "require"
+    }
+  ]
+}
+
+Email
+
+Por defeito, o envio usa SMTP em localhost. Se não tiveres SMTP local:
+
+    configurar SMTP externo (host/porta/auth), ou
+
+    desativar envio de email no ambiente de dev.
+
+Variáveis lógicas:
+
+    PIPELINE_EMAIL_FROM
+
+    PIPELINE_EMAIL_TO (emails separados por vírgula)
+
+    Recomendação: não manter destinatários reais hardcoded.
+
+Como executar
+
 python main.py
-```
 
-O `__main__` inicia por defeito:
+O __main__ executa por defeito a variante “normal”.
+Modo offline
 
-- `pipeline_meteo_normal(API_URL)`
+Se a pipeline não conseguir ligar a nenhuma BD, entra em modo offline e grava CSV:
 
----
+    pasta: offline_output/
 
-## Modo offline (sem base de dados)
+    ficheiro: meteo_YYYYMMDD_HHMMSS.csv
 
-Nesta iteração, a pipeline suporta execução offline quando não há acesso à base de dados. Em vez de executar a inserção SQL, os registos resultantes do parsing são guardados num ficheiro CSV para auditoria e validação do pipeline.
+Fluxo da pipeline
 
----
-
-## Fluxo da pipeline
-
-```mermaid
 flowchart LR
-  A["Request API"] --> B["Recepcao/Validacao JSON"]
-  B --> C["Parsing JSON → lista de registos"]
-  C --> D["Ligacao BD"]
-  D --> E["Preparacao da query"]
-  E --> F["Execucao da query (executemany e commit)"]
-  F --> G["Fecho da ligacao"]
-  G --> H["Email com sumario + print da tabela"]
-```
+  A["Definir contexto (env/.env)"] --> B["Escolher API (Weatherbit/IPMA)"]
+  B --> C["Request API"]
+  C --> D["Receção/Validação JSON"]
+  D --> E["Parsing JSON → parsed_data"]
+  E --> F["Carregar targets BD (db_targets.json / env)"]
+  F --> G["Ligar a múltiplas BD (fail-safe)"]
+  G --> H["Checker: deduplicação (por registo)"]
+  H --> I["Insert (BDs disponíveis)"]
+  I --> J["Se 0 BDs → dump CSV (offline_output/)"]
+  J --> K["Fecho ligações"]
+  K --> L["Resumo: terminal + email HTML"]
 
-As métricas por etapa (tempo em segundos) são guardadas num `summary` com o formato:
+Tabela alvo e modelo de dados
+Tabela alvo (modo online)
 
-- `[Etapa, Status, Watch Time (s)]`
+Nesta versão, a persistência assume uma tabela meteo (ou equivalente) com colunas:
 
----
+    fonte, data, temp, humidade, vento, pressao, precipitacao
 
-## Tabela alvo ipma obs
+    lugar, lat, lon
 
-A tabela alvo do logbook chama-se **`ipma_obs`**. Campos principais (resumo):
+    regdata (timestamp de registo, ex: NOW())
 
-| Coluna | Tipo |
-|---|---|
-| `fonte` | varchar(30) |
-| `created` | timestamp (DEFAULT CURRENT_TIMESTAMP) |
-| `time` | timestamp |
-| `idestacao` | varchar(30) |
-| `localestacao` | varchar(30) |
-| `intensidadeventokm` | real |
-| `intensidadevento` | real |
-| `descdirvento` | varchar(5) |
-| `temperatura` | real |
-| `pressao` | real |
-| `humidade` | real |
-| `precacumulada` | real |
-| `iddireccvento` | int |
-| `radiacao` | real |
-| `latitude` | real |
-| `longitude` | real |
+    A tabela ipma_obs pode continuar a existir como objetivo do logbook, mas o estado atual (v0.3) usa um modelo mínimo (meteo) para suportar ambas as fontes (Weatherbit/IPMA).
 
-### Mapeamento (Weatherbit Current -> parsed_data)
+Registo normalizado
 
-Campos extraídos do Weatherbit (`data[]`) e normalizados em `parsed_data`:
+Independentemente da fonte, a pipeline produz registos com:
 
-- `fonte` -> `"Weatherbit"`
-- `data` -> `ob_time`
-- `cidade` -> `city_name`
-- `pais` -> `country_code`
-- `temp` -> `temp`
-- `sensacao_termica` -> `app_temp`
-- `humidade` -> `rh`
-- `vento` -> `wind_spd`
-- `vento_dir` -> `wind_dir`
-- `vento_desc` -> `wind_cdir_full`
-- `pressao` -> `pres`
-- `precipitacao` -> `precip`
-- `uv` -> `uv`
-- `radiacao_solar` -> `solar_rad`
-- `nuvens` -> `clouds`
-- `condicao` -> `weather.description`
-- `estacao` -> `station`
-- `nascer_sol` -> `sunrise`
-- `por_sol` -> `sunset`
-- `lat` -> `lat`
-- `lon` -> `lon`
+    fonte
 
-> Nota: o mapeamento antigo (IPMA / `ipma_obs`) está preservado nos snapshots em `docs/iterations/v0.1/`.
+    data
 
+    temp
 
+    humidade
 
-### Query (referência para modo online)
+    vento
 
-Mesmo em modo offline (CSV), a query fica definida como referência para quando o modo BD voltar.
+    pressao
 
-```sql
-INSERT INTO meteo (
-  fonte, data, lugar, lat, lon,
-  temp, humidade, vento, pressao, precipitacao,
-  uv, radiacao_solar, nuvens, condicao,
-  vento_dir, vento_desc, sensacao_termica, pais, estacao, nascer_sol, por_sol
-)
-VALUES (
-  %(fonte)s, %(data)s, %(lugar)s, %(lat)s, %(lon)s,
-  %(temp)s, %(humidade)s, %(vento)s, %(pressao)s, %(precipitacao)s,
-  %(uv)s, %(radiacao_solar)s, %(nuvens)s, %(condicao)s,
-  %(vento_dir)s, %(vento_desc)s, %(sensacao_termica)s, %(pais)s, %(estacao)s, %(nascer_sol)s, %(por_sol)s
-);
+    precipitacao
 
-```
+    lugar
 
----
+    lat
 
-## Funcoes (API interna)
+    lon
 
-> Dica: nesta 1ª iteração, documentou-se “o que existe”. Nas iterações seguintes, irá ser atualizada esta secção com as mudanças e o racional.
+Mapeamento Weatherbit
 
-### `request_data(api_url)`
+    fonte → "WEATHERBIT"
 
-- **O que faz:** GET ao endpoint REST e devolve JSON + tempo.
-- **Retorna:** `(json_dict, elapsed_s)`
-- **Erros:** exceptions de rede/HTTP (`raise_for_status`, timeout, etc.)
+    data → ob_time
 
-### `receive_data(json_data)`
+    temp → temp
 
-- **O que faz:** valida que o JSON não está vazio.
-- **Retorna:** `(json_data, elapsed_s)`
-- **Erros:** `ValueError` se o JSON for vazio/ inválido.
+    humidade → rh
 
-### `parse_data(json_data)`
+    vento → wind_spd
 
-- **O que faz:** transforma o JSON do IPMA em lista de registos (um por estação e timestamp).
-- **Retorna:** `(parsed_list, elapsed_s)`
+    pressao → pres
 
-### `connect_db()`
+    precipitacao → precip
 
-- **O que faz:** cria a ligação à BD via `psycopg2`.
-- **Retorna:** `(conn, elapsed_s)`
+    lugar → city_name (ou WEATHERBIT_CITY)
 
-### `prepare_query(parsed_data)`
+    lat/lon → lat/lon
 
-- **O que faz:** define a SQL de inserção (parametrizada).
-- **Retorna:** `(query_str, elapsed_s)`
-- **Nota:** o parâmetro `parsed_data` não é usado nesta versão.
+Mapeamento IPMA
 
-### `execute_query(conn, query, parsed_data)`
+    fonte → "IPMA"
 
-- **O que faz:** `executemany(query, parsed_data)` + `commit()`.
-- **Retorna:** `elapsed_s`
+    data → timestamp (top-level key)
 
-### `close_connection(conn)`
+    temp → temperatura
 
-- **O que faz:** fecha a ligação à BD.
-- **Retorna:** `elapsed_s`
+    humidade → humidade
 
-### `send_summary_email(summary_rows)`
+    vento → intensidadeVento
 
-- **O que faz:** constrói uma tabela HTML (`tabulate`) e envia email via SMTP.
-- **Notas:** requer SMTP em `localhost` (ajustar em ambiente cloud).
+    pressao → pressao
 
-### `pipeline_meteo_normal(api_url)`
+    precipitacao → precAcumulada
 
-- **O que faz:** executa o fluxo completo e constrói o `summary`.
-- **Em erro:** adiciona `["Erro", "FAIL (...)", 0]`.
-- **Finalmente:** envia email e imprime a tabela.
+    lugar → station_id (usado como identificador por estação)
 
-### `pipeline_meteo_heavy(api_url)`
+    lat/lon → None (ainda sem enrichment nesta iteração)
 
-- **O que faz:** igual à normal, mas liga à BD primeiro.
-- **Em erro:** tenta fechar a ligação se já existir.
-- **Finalmente:** envia email e imprime a tabela.
+Deduplicação
 
----
+Antes de inserir, a pipeline corre um “checker” para saber se o registo já existe.
 
-## Limitacoes conhecidas (baseline)
+Chave lógica recomendada (v0.3):
 
-- **Desalinhamento parsing ↔ SQL / tabela alvo**
-  - O parsing está mais próximo de `ipma_obs`, mas a query actual aponta para `meteo` e usa campos que não existem no parsed (ex: `lugar`, `lat`, `lon`).
-- **Credenciais no código**
-  - Devem passar para env vars/secrets para permitir portabilidade e partilha segura.
-- **Sem idempotencia / deduplicacao**
-  - Se correr várias vezes, podes inserir duplicados (futuro: `ON CONFLICT`, chaves naturais, etc.).
-- **Dependencia de SMTP local**
-  - Em cloud, `localhost` pode não ter SMTP.
+    fonte
 
----
+    data
 
-## Proximos passos
+    lugar
 
-1. Alinhar `parse_data()` + `prepare_query()` com a tabela `ipma_obs`
-2. Enriquecimento: obter `localestacao/lat/lon` via metadados das estações
-3. Migrar configuração para `env vars`/secrets e retirar credenciais do código
-4. Implementar deduplicação / idempotência (ex: `ON CONFLICT`)
-5. Melhorar logging e rastreabilidade (endpoint, destino, contexto de execução)
+Exemplo de checker SQL (referência):
+
+SELECT 1
+FROM meteo
+WHERE fonte = %(fonte)s
+  AND data = %(data)s
+  AND lugar = %(lugar)s
+LIMIT 1;
+
+Se existir, o registo é contado como skip; caso contrário, é insert.
+Funções principais
+
+Nesta v0.3, a pipeline inclui (alto nível):
+
+    Context/config
+
+        carregar .env e ler variáveis (PIPELINE_*, DB_*, WEATHERBIT_*)
+
+    API
+
+        request/validate/parse (Weatherbit ou IPMA)
+
+    DB
+
+        carregar targets (db_targets.json ou fallback por env)
+
+        ligar a múltiplos targets (fail-safe)
+
+        checker de deduplicação + insert
+
+    Offline
+
+        dump CSV se nenhuma BD estiver disponível
+
+    Monitor/relatório
+
+        tempos por etapa + status
+
+        email HTML (se SMTP configurado)
+
+    Para documentação por versão: ver docs/iterations/v0.3/ (notes/mapping/evidence + code.diff).
+
+Limitações conhecidas
+
+    Email: por defeito depende de SMTP local (localhost).
+
+    Segredos:
+
+        nunca commitar .env
+
+        nunca commitar db_targets.json com passwords
+
+    Deduplicação: chave (fonte, data, lugar) é simples; pode ser melhorada conforme schema final.
+
+    Performance: inserção linha-a-linha é funcional, mas pode ser otimizada (batch inserts).
+
+    Enrichment IPMA: lat/lon/local de estação ainda não são enriquecidos nesta iteração.
+
+Próximos passos
+
+    Inserção em batch por DB + melhor agregação de contadores (ins/skip por target)
+
+    Enrichment IPMA (nome da estação, lat/lon) via endpoint/tabela de estações
+
+    Tornar email opcional por flag/env (ex: PIPELINE_SEND_EMAIL=0/1)
+
+    Evoluir schema para suportar mais campos Weatherbit (UV, clouds, condição, etc.)
+
+    Idempotência mais forte (ON CONFLICT / unique constraints)
