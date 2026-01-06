@@ -1,14 +1,13 @@
 import os
 import json
 import requests
+import time
 from datetime import datetime, timezone, timedelta, date
 from urllib.parse import urlparse, unquote
-
 from tabulate import tabulate
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -81,52 +80,83 @@ def get_context() -> dict:
 
 
 # ---------------- monitoring helper ----------------
-def _clts_seconds(dt_obj) -> float:
-    if isinstance(dt_obj, (tuple, list)) and len(dt_obj) >= 1:
-        try:
-            return float(dt_obj[0])
-        except Exception:
-            return 0.0
+def _clts_watch_proc(dt_obj) -> tuple[float, float]:
+    # clts.deltat costuma devolver (watch, proc)
+    if isinstance(dt_obj, (tuple, list)):
+        w = float(dt_obj[0]) if len(dt_obj) > 0 else 0.0
+        p = float(dt_obj[1]) if len(dt_obj) > 1 else 0.0
+        return w, p
     if isinstance(dt_obj, dict):
-        for k in ("watch", "watch_time", "elapsed", "secs", "seconds"):
-            if k in dt_obj:
-                try:
-                    return float(dt_obj[k])
-                except Exception:
-                    return 0.0
+        w = float(dt_obj.get("watch", dt_obj.get("watch_time", dt_obj.get("elapsed", 0.0))) or 0.0)
+        p = float(dt_obj.get("proc", dt_obj.get("proc_time", 0.0)) or 0.0)
+        return w, p
     try:
-        return float(dt_obj)
+        return float(dt_obj), 0.0
     except Exception:
-        return 0.0
+        return 0.0, 0.0
 
 
 class StepMonitor:
     def __init__(self, ctx: dict):
         self.ctx = ctx
-        self.summary: list[list] = []
-        self.use_clts = HAS_CLTS
+        self.summary: list[dict] = []  # {"step","status","watch","proc"}
+        self.use_clts = HAS_CLTS and os.getenv("USE_CLTS_PCP", "0") == "1"
+
+        self._w_prev = time.perf_counter()
+        self._p_prev = time.process_time()
+
         if self.use_clts:
             clts.setcontext(f"{ctx['pipeline_name']} ({ctx['env']})")
             self._ts_prev = clts.getts()
 
-    def mark(self, step: str, status: str = "OK", seconds_override: float | None = None) -> float:
+    def mark(self, step: str, status: str = "", seconds_override: float | None = None) -> float:
         if seconds_override is not None:
-            secs = round(float(seconds_override), 2)
+            watch = float(seconds_override)
+            proc = 0.0
         elif self.use_clts:
             dt = clts.deltat(self._ts_prev)
-            clts.elapt[f"{step} ({status})."] = dt
-            secs = round(_clts_seconds(dt), 2)
+            watch, proc = _clts_watch_proc(dt)
             self._ts_prev = clts.getts()
         else:
-            secs = 0.0
+            w_now = time.perf_counter()
+            p_now = time.process_time()
+            watch = w_now - self._w_prev
+            proc = p_now - self._p_prev
+            self._w_prev = w_now
+            self._p_prev = p_now
 
-        self.summary.append([step, status, secs])
-        return secs
+        self.summary.append({"step": str(step), "status": str(status), "watch": float(watch), "proc": float(proc)})
+        return float(watch)
+
+    def pcp_rows_total(self) -> list[list]:
+        w_total = 0.0
+        p_total = 0.0
+        rows: list[list] = []
+
+        for r in self.summary:
+            w_total += r["watch"]
+            p_total += r["proc"]
+
+            label = r["step"]
+            if r["status"]:
+                label = f"{label} ({r['status']})"
+
+            rows.append([label, round(w_total, 2), round(p_total, 2)])
+
+        rows.append(["Overall (before email):", round(w_total, 2), round(p_total, 2)])
+        return rows
+
+    def _header0(self) -> str:
+        # opcional: deixa-te pôr um header exatamente como o PCP via env var
+        # ex: PIPELINE_PCP_HEADER="Task(s) of TP16G2-PCP (176.223.60.34) | PCP | scripts | pcp_meteo_icao.py | -*."
+        return os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {self.ctx['pipeline_name']} ({self.ctx['env']})."
 
     def html_table(self) -> str:
-        if self.use_clts:
-            return clts.listtimes()
-        return tabulate(self.summary, headers=["Etapa", "Status", "Watch Time (s)"], tablefmt="html")
+        return tabulate(
+            self.pcp_rows_total(),
+            headers=[self._header0(), "watch time (secs)", "proc time (secs)"],
+            tablefmt="html",
+        )
 
 
 # ---------------- API fetch / parse ----------------
@@ -305,13 +335,17 @@ def _parse_mysql_dsn(dsn: str) -> dict:
     return {"host": host, "port": port, "user": user, "password": password, "database": dbname}
 
 
-def connect_targets(targets: list[dict]) -> tuple[dict, dict]:
+def connect_targets(targets: list[dict], mon: StepMonitor | None = None) -> tuple[dict, dict]:
     handles: dict[str, dict] = {}
     errors: dict[str, str] = {}
 
     for t in targets:
         name = t["name"]
         ttype = t["type"]
+
+        if mon:
+            mon.mark(f"Connecting to `{name}`")
+
         try:
             if ttype in ("postgres", "cratedb"):
                 if not HAS_PG:
@@ -353,11 +387,15 @@ def connect_targets(targets: list[dict]) -> tuple[dict, dict]:
             else:
                 raise RuntimeError(f"type não suportado: {ttype}")
 
+            if mon:
+                mon.mark(f"... connected to `{name}`")
+
         except Exception as e:
             errors[name] = str(e)
+            if mon:
+                mon.mark(f"... failed to connect to `{name}`: {e}", "FAIL")
 
     return handles, errors
-
 
 def close_targets(handles: dict) -> None:
     for h in handles.values():
@@ -469,7 +507,6 @@ def build_batches_by_fonte_day(rows: list[dict]) -> dict[tuple[str, date], list[
 def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | None = None) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
-    msg["From"] = ctx["email_from"]
     msg["To"] = ", ".join(ctx["email_to"])
 
     extra_info = (
@@ -498,8 +535,29 @@ def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | Non
     msg.attach(MIMEText(body, "html"))
 
     try:
-        with smtplib.SMTP("localhost") as server:
+        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER")
+        smtp_pass = os.getenv("SMTP_PASS")
+
+        if not smtp_user or not smtp_pass:
+            raise RuntimeError("Faltam SMTP_USER / SMTP_PASS no .env")
+
+
+        email_from = os.getenv("PIPELINE_EMAIL_FROM") or smtp_user or ctx["email_from"]
+        if "From" in msg:
+            msg.replace_header("From", email_from)
+        else:
+            msg["From"] = email_from
+
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_user, smtp_pass)
             server.send_message(msg)
+
         print("Email enviado com sucesso.")
     except Exception as e:
         print(f"Falha ao enviar email: {e}")
@@ -514,35 +572,33 @@ def pipeline_meteo(ctx: dict):
 
     try:
         data = request_data(ctx["api_url"])
-        mon.mark("Request API", "OK")
+        mon.mark("Data request successful!")
 
         received = receive_data(data)
-        mon.mark("Recepção", "OK")
+        mon.mark("Data reception successful!")
 
         rows = parse_data(received)
         if not rows:
             raise ValueError("Parsing devolveu 0 linhas (verifica a API / parse).")
-        mon.mark(f"Parsing ({len(rows)} linhas)", "OK")
+        mon.mark(f"Parsing ({len(rows)} linhas)")
 
         targets = load_db_targets(ctx)
-        mon.mark(f"Load DB targets ({len(targets)})", "OK")
+        mon.mark(f"Load DB targets ({len(targets)})")
 
-        handles, errors = connect_targets(targets)
+        mon.mark("Starting database accesses:")
+        handles, errors = connect_targets(targets, mon=mon)
+
         extra_lines.append(f"Targets ligados: {', '.join(handles.keys()) if handles else '(nenhum)'}")
         if errors:
             extra_lines.append("Targets com erro: " + "; ".join([f"{k}={v}" for k, v in errors.items()]))
 
-        mon.mark("Ligação targets", "OK" if handles else "WARN")
-
         if not handles:
             fp = offline_dump(rows)
-            mon.mark("Persistência offline (CSV)", "OK")
-            extra_lines.append(f"CSV offline: {fp}")
+            mon.mark(f"Data saved to file `{fp}`")
             return mon, extra_lines
 
-        # Checker: don't insert same day twice (per target, per fonte)
         batches = build_batches_by_fonte_day(rows)
-        mon.mark(f"Batching por fonte+dia ({len(batches)} batches)", "OK")
+        mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
 
         for target_name, h in handles.items():
             inserted = 0
@@ -556,6 +612,7 @@ def pipeline_meteo(ctx: dict):
 
                 if exists and DEDUP_MODE == "date":
                     skipped += len(batch_rows)
+                    mon.mark(f"... `{day}` skipped for {fonte} @ {target_name} (dedup)")
                     continue
 
                 if h["type"] == "mongodb":
@@ -564,22 +621,29 @@ def pipeline_meteo(ctx: dict):
                     sql_insert_many(h, batch_rows)
 
                 inserted += len(batch_rows)
+                mon.mark(f"... `{day}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
 
-            mon.mark(f"Write [{target_name}] (ins={inserted}, skip={skipped})", "OK")
+            # linha resumo (opcional, mas útil)
+            mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
 
     except Exception as e:
-        mon.mark("Erro", f"FAIL ({e})")
+        mon.mark(f"Erro: {e}", "FAIL")
         extra_lines.append(f"Erro: {e}")
 
     finally:
         try:
             close_targets(handles)
-            mon.mark("Fecho targets", "OK")
+            mon.mark("Fecho targets")
         except Exception:
             pass
 
         send_summary_email(ctx, mon, extra_lines=extra_lines)
-        print(tabulate(mon.summary, headers=["Etapa", "Status", "Watch Time (s)"]))
+
+        print(tabulate(
+            mon.pcp_rows_total(),
+            headers=[os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {ctx['pipeline_name']} ({ctx['env']}).",
+                     "watch time (secs)", "proc time (secs)"]
+        ))
 
     return mon, extra_lines
 
