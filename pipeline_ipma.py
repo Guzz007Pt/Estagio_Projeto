@@ -46,7 +46,8 @@ except Exception:
 
 load_dotenv()
 
-DEFAULT_PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-METEO")
+# ---------------- core env keys ----------------
+DEFAULT_PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-IPMA")
 DEFAULT_EMAIL_FROM = os.getenv("PIPELINE_EMAIL_FROM", "estagio.pipeline@example.com")
 DEFAULT_EMAIL_TO = [e.strip() for e in os.getenv(
     "PIPELINE_EMAIL_TO",
@@ -61,12 +62,21 @@ DEFAULT_DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json
 # - "none": always insert
 DEDUP_MODE = os.getenv("PIPELINE_DEDUP_MODE", "timestamp").strip().lower()
 
-# ---- API defaults: Weatherbit if key else IPMA ----
-WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "")
-WEATHERBIT_CITY = os.getenv("WEATHERBIT_CITY", "Maia,PT")
-WEATHERBIT_URL = f"https://api.weatherbit.io/v2.0/current?city={WEATHERBIT_CITY}&key={WEATHERBIT_KEY}"
-IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
-DEFAULT_API_URL = os.getenv("PIPELINE_API_URL", WEATHERBIT_URL if WEATHERBIT_KEY else IPMA_URL)
+# ---------------- IPMA endpoints ----------------
+IPMA_OBS_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
+IPMA_STATIONS_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/stations.json"
+
+# Allow override(PIPELINE_API_URL)
+DEFAULT_API_URL = os.getenv("PIPELINE_API_URL", IPMA_OBS_URL)
+
+# Optional: restrict to certain stations (e.g. only Maia)
+# Example: IPMA_STATION_IDS=1234,5678
+IPMA_STATION_IDS = [s.strip() for s in os.getenv("IPMA_STATION_IDS", "").split(",") if s.strip()]
+
+
+IPMA_FETCH_STATIONS_META = os.getenv("IPMA_FETCH_STATIONS_META", "1").strip() == "1"
+
+_IPMA_STATION_MAP = None  # cache
 
 
 def get_context() -> dict:
@@ -159,9 +169,10 @@ class StepMonitor:
         )
 
 
-# ---------------- API fetch / parse ----------------
+# ---------------- API fetch / parse (IPMA-specific) ----------------
 def request_data(api_url: str) -> dict:
-    resp = requests.get(api_url, timeout=20)
+    # IPMA observations.json
+    resp = requests.get(api_url, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -199,66 +210,98 @@ def _parse_ts_any(value) -> datetime:
 
 
 def _ts_utc_naive(value) -> datetime:
-    """
-    Normalize timestamp to UTC, drop microseconds, and store as naive datetime (UTC).
-    This makes equality checks stable across SQL/Mongo.
-    """
     dt = value if isinstance(value, datetime) else _parse_ts_any(value)
     dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     dt = dt.replace(microsecond=0)
     return dt.replace(tzinfo=None)  # naive UTC
 
 
+def _get_ipma_station_map() -> dict[str, dict]:
+    """
+    Returns mapping station_id -> {"lat": float|None, "lon": float|None, "name": str|None}
+    Uses IPMA stations.json (GeoJSON).
+    """
+    global _IPMA_STATION_MAP
+    if _IPMA_STATION_MAP is not None:
+        return _IPMA_STATION_MAP
+
+    _IPMA_STATION_MAP = {}
+    if not IPMA_FETCH_STATIONS_META:
+        return _IPMA_STATION_MAP
+
+    try:
+        r = requests.get(IPMA_STATIONS_URL, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        features = data.get("features", []) if isinstance(data, dict) else []
+        for feat in features:
+            props = feat.get("properties", {}) if isinstance(feat, dict) else {}
+            geom = feat.get("geometry", {}) if isinstance(feat, dict) else {}
+            coords = geom.get("coordinates") if isinstance(geom, dict) else None
+
+            sid = props.get("idEstacao") or props.get("id") or props.get("stationId")
+            if sid is None:
+                continue
+            sid = str(sid)
+
+            lon = lat = None
+            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                # GeoJSON typically [lon, lat]
+                lon, lat = coords[0], coords[1]
+
+            _IPMA_STATION_MAP[sid] = {
+                "lat": lat,
+                "lon": lon,
+                "name": props.get("localEstacao") or props.get("nome") or props.get("name")
+            }
+    except Exception:
+        # metadata is optional; silently continue without it
+        _IPMA_STATION_MAP = {}
+
+    return _IPMA_STATION_MAP
+
+
 def parse_data(json_data: dict) -> list[dict]:
     """
-    Canonical row format (works for every DB target):
+    Produces the same canonical rows your main pipeline expects:
       fonte, data(datetime), temp, humidade, vento, pressao, precipitacao, lugar, lat, lon
+    IPMA: lugar = station_id (string)
+    Optional filter: IPMA_STATION_IDS
+    Optional fill: lat/lon via stations.json
     """
-    # Weatherbit
-    if isinstance(json_data, dict) and "data" in json_data and isinstance(json_data["data"], list) and json_data["data"]:
-        obs = json_data["data"][0]
-        if "ob_time" in obs:
-            dt = _parse_ts_any(obs["ob_time"])
-        elif "ts" in obs:
-            dt = _parse_ts_any(int(obs["ts"]))
-        else:
-            dt = datetime.now(timezone.utc)
+    station_map = _get_ipma_station_map()
 
-        return [{
-            "fonte": "WEATHERBIT",
-            "data": dt,
-            "temp": obs.get("temp"),
-            "humidade": obs.get("rh"),
-            "vento": obs.get("wind_spd"),
-            "pressao": obs.get("pres"),
-            "precipitacao": obs.get("precip"),
-            "lugar": obs.get("city_name") or WEATHERBIT_CITY,
-            "lat": obs.get("lat"),
-            "lon": obs.get("lon"),
-        }]
-
-    # IPMA
     parsed: list[dict] = []
-    if isinstance(json_data, dict):
-        for timestamp, stations in json_data.items():
-            if not isinstance(stations, dict):
+    if not isinstance(json_data, dict):
+        return parsed
+
+    for timestamp, stations in json_data.items():
+        if not isinstance(stations, dict):
+            continue
+        ts_dt = _parse_ts_any(timestamp)
+
+        for station_id, values in stations.items():
+            if not isinstance(values, dict):
                 continue
-            ts_dt = _parse_ts_any(timestamp)
-            for station_id, values in stations.items():
-                if not isinstance(values, dict):
-                    continue
-                parsed.append({
-                    "fonte": "IPMA",
-                    "data": ts_dt,
-                    "temp": values.get("temperatura"),
-                    "humidade": values.get("humidade"),
-                    "vento": values.get("intensidadeVento"),
-                    "pressao": values.get("pressao"),
-                    "precipitacao": values.get("precAcumulada"),
-                    "lugar": str(station_id),
-                    "lat": None,
-                    "lon": None,
-                })
+
+            sid = str(station_id)
+            if IPMA_STATION_IDS and sid not in IPMA_STATION_IDS:
+                continue
+
+            meta = station_map.get(sid, {})
+            parsed.append({
+                "fonte": "IPMA",
+                "data": ts_dt,
+                "temp": values.get("temperatura"),
+                "humidade": values.get("humidade"),
+                "vento": values.get("intensidadeVento"),
+                "pressao": values.get("pressao"),
+                "precipitacao": values.get("precAcumulada"),
+                "lugar": sid,
+                "lat": meta.get("lat"),
+                "lon": meta.get("lon"),
+            })
+
     return parsed
 
 
@@ -420,7 +463,7 @@ def close_targets(handles: dict) -> None:
             pass
 
 
-# ---------------- DEDUPE + INSERT ----------------
+# ---------------- DEDUPE + INSERT (same as main.py) ----------------
 COLUMNS = ["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"]
 
 
@@ -446,7 +489,6 @@ def rows_to_tuples(rows: list[dict]) -> list[tuple]:
     return out
 
 
-# --- legacy day-based ---
 def sql_exists_day(handle: dict, fonte: str, day: date) -> bool:
     table = handle["table"]
     conn = handle["conn"]
@@ -475,7 +517,6 @@ def mongo_exists_day(handle: dict, fonte: str, day: date) -> bool:
     return col.find_one(q, {"_id": 1}) is not None
 
 
-# --- timestamp-based (NEW) ---
 def sql_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
     table = handle["table"]
     conn = handle["conn"]
@@ -555,7 +596,7 @@ def build_batches_by_fonte_ts(rows: list[dict]) -> dict[tuple[str, datetime], li
     return batches
 
 
-# ---------------- Email ----------------
+# ---------------- Email (same as main.py) ----------------
 def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | None = None) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
@@ -642,12 +683,12 @@ def pipeline_meteo(ctx: dict):
         if errors:
             extra_lines.append("Targets com erro: " + "; ".join([f"{k}={v}" for k, v in errors.items()]))
 
+
         if not handles:
             fp = offline_dump(rows)
             mon.mark(f"Data saved to file `{fp}`")
             return mon, extra_lines
 
-        # -------- DEDUPE + BATCHING --------
         if DEDUP_MODE == "date":
             batches = build_batches_by_fonte_day(rows)
             mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
@@ -686,11 +727,9 @@ def pipeline_meteo(ctx: dict):
                 skipped = 0
 
                 for (fonte, ts), batch_rows in batches.items():
-                    # normalize ts in rows
                     for r in batch_rows:
                         r["data"] = _ts_utc_naive(r.get("data"))
 
-                    # dedupe by (fonte, ts, lugar)
                     if h["type"] == "mongodb":
                         existing_lugares = mongo_existing_lugares_ts(h, fonte, ts)
                     else:
@@ -714,7 +753,6 @@ def pipeline_meteo(ctx: dict):
                 mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
 
         else:
-            # "none": always insert
             batches = build_batches_by_fonte_ts(rows)
             mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
 

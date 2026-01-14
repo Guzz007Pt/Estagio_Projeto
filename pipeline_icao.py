@@ -1,3 +1,4 @@
+# pipeline_icao.py
 import os
 import json
 import requests
@@ -46,7 +47,8 @@ except Exception:
 
 load_dotenv()
 
-DEFAULT_PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-METEO")
+# ---------------- core env keys (same style as main.py) ----------------
+DEFAULT_PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-ICAO")
 DEFAULT_EMAIL_FROM = os.getenv("PIPELINE_EMAIL_FROM", "estagio.pipeline@example.com")
 DEFAULT_EMAIL_TO = [e.strip() for e in os.getenv(
     "PIPELINE_EMAIL_TO",
@@ -61,12 +63,20 @@ DEFAULT_DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json
 # - "none": always insert
 DEDUP_MODE = os.getenv("PIPELINE_DEDUP_MODE", "timestamp").strip().lower()
 
-# ---- API defaults: Weatherbit if key else IPMA ----
-WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "")
-WEATHERBIT_CITY = os.getenv("WEATHERBIT_CITY", "Maia,PT")
-WEATHERBIT_URL = f"https://api.weatherbit.io/v2.0/current?city={WEATHERBIT_CITY}&key={WEATHERBIT_KEY}"
-IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
-DEFAULT_API_URL = os.getenv("PIPELINE_API_URL", WEATHERBIT_URL if WEATHERBIT_KEY else IPMA_URL)
+# ---------------- GeoNames / ICAO config ----------------
+# You MUST create a GeoNames username and put it here.
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME", "").strip()
+
+# Use one or more ICAO codes (comma-separated).
+# Example: ICAO_CODES=LPPR
+ICAO_CODES = [s.strip().upper() for s in os.getenv("ICAO_CODES", "").split(",") if s.strip()]
+
+# Optional: override base endpoint (rarely needed)
+GEONAMES_ICAO_ENDPOINT = os.getenv("GEONAMES_ICAO_ENDPOINT", "https://api.geonames.org/weatherIcaoJSON").strip()
+
+# Allow overriding the whole request URL via PIPELINE_API_URL only if you really want
+# (but normally you should use GEONAMES_USERNAME + ICAO_CODES).
+PIPELINE_API_URL_OVERRIDE = os.getenv("PIPELINE_API_URL", "").strip()
 
 
 def get_context() -> dict:
@@ -74,7 +84,7 @@ def get_context() -> dict:
         "pipeline_name": DEFAULT_PIPELINE_NAME,
         "env": os.getenv("PIPELINE_ENV", "local"),
         "user": os.getenv("PIPELINE_USER", "gustavo"),
-        "api_url": DEFAULT_API_URL,
+        "api_url": PIPELINE_API_URL_OVERRIDE or GEONAMES_ICAO_ENDPOINT,
         "email_from": DEFAULT_EMAIL_FROM,
         "email_to": DEFAULT_EMAIL_TO,
         "dashboard_url": os.getenv("PIPELINE_DASHBOARD_URL_METEO", ""),
@@ -159,19 +169,7 @@ class StepMonitor:
         )
 
 
-# ---------------- API fetch / parse ----------------
-def request_data(api_url: str) -> dict:
-    resp = requests.get(api_url, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def receive_data(json_data: dict) -> dict:
-    if not json_data:
-        raise ValueError("JSON vazio ou inválido")
-    return json_data
-
-
+# ---------------- time helpers ----------------
 def _parse_ts_any(value) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -199,67 +197,121 @@ def _parse_ts_any(value) -> datetime:
 
 
 def _ts_utc_naive(value) -> datetime:
-    """
-    Normalize timestamp to UTC, drop microseconds, and store as naive datetime (UTC).
-    This makes equality checks stable across SQL/Mongo.
-    """
     dt = value if isinstance(value, datetime) else _parse_ts_any(value)
     dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     dt = dt.replace(microsecond=0)
     return dt.replace(tzinfo=None)  # naive UTC
 
 
-def parse_data(json_data: dict) -> list[dict]:
+# ---------------- API fetch / parse (GeoNames ICAO-specific) ----------------
+def _build_geonames_icao_url(icao: str) -> str:
+    # Example:
+    # https://api.geonames.org/weatherIcaoJSON?ICAO=LPPR&username=XXXX
+    return f"{GEONAMES_ICAO_ENDPOINT}?ICAO={icao}&username={GEONAMES_USERNAME}"
+
+
+def request_data(api_url: str) -> list[dict]:
     """
-    Canonical row format (works for every DB target):
+    Returns a list of GeoNames responses (one per ICAO).
+    If PIPELINE_API_URL is set, it will fetch that single URL (advanced/override use).
+    """
+    if PIPELINE_API_URL_OVERRIDE:
+        resp = requests.get(PIPELINE_API_URL_OVERRIDE, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return [data] if isinstance(data, dict) else []
+
+    if not GEONAMES_USERNAME:
+        raise RuntimeError("Falta GEONAMES_USERNAME no .env (GeoNames exige username).")
+    if not ICAO_CODES:
+        raise RuntimeError("Falta ICAO_CODES no .env (ex: ICAO_CODES=LPPR).")
+
+    results: list[dict] = []
+    for icao in ICAO_CODES:
+        url = _build_geonames_icao_url(icao)
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        j = resp.json()
+        if isinstance(j, dict):
+            # keep trace of which ICAO we requested (helpful if API response is ambiguous)
+            j["_requested_icao"] = icao
+            results.append(j)
+    return results
+
+
+def receive_data(json_data: list[dict]) -> list[dict]:
+    if not json_data:
+        raise ValueError("JSON vazio ou inválido")
+    return json_data
+
+
+def _to_float(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def parse_data(json_list: list[dict]) -> list[dict]:
+    """
+    Produces canonical rows:
       fonte, data(datetime), temp, humidade, vento, pressao, precipitacao, lugar, lat, lon
+
+    GeoNames weatherIcaoJSON usually returns fields like:
+      temperature, humidity, windSpeed, windDirection, clouds, stationName, lat, lng, datetime, observation
+    Not all are guaranteed; we map what exists.
     """
-    # Weatherbit
-    if isinstance(json_data, dict) and "data" in json_data and isinstance(json_data["data"], list) and json_data["data"]:
-        obs = json_data["data"][0]
-        if "ob_time" in obs:
-            dt = _parse_ts_any(obs["ob_time"])
-        elif "ts" in obs:
-            dt = _parse_ts_any(int(obs["ts"]))
-        else:
-            dt = datetime.now(timezone.utc)
+    rows: list[dict] = []
 
-        return [{
-            "fonte": "WEATHERBIT",
+    for j in json_list:
+        if not isinstance(j, dict):
+            continue
+
+        # GeoNames typical payload key is "weatherObservation"
+        obs = j.get("weatherObservation")
+        if not isinstance(obs, dict):
+            # Sometimes GeoNames returns {"status": {...}} on error
+            # We'll skip those, but you can see details in email extra lines
+            continue
+
+        # Timestamp: prefer 'datetime' if present; else fallback to now
+        dt_raw = obs.get("datetime") or obs.get("observationTime") or obs.get("time")
+        dt = _parse_ts_any(dt_raw) if dt_raw else datetime.now(timezone.utc)
+
+        # Place: ICAO requested (most stable)
+        icao = (obs.get("ICAO") or j.get("_requested_icao") or "").strip().upper()
+        if not icao:
+            icao = "UNKNOWN_ICAO"
+
+        # Core values (many may be missing)
+        temp = _to_float(obs.get("temperature"))
+        hum = _to_float(obs.get("humidity"))
+        wind = _to_float(obs.get("windSpeed"))
+        pres = _to_float(obs.get("hectoPascAltimeter")) or _to_float(obs.get("seaLevelPressure")) or _to_float(obs.get("pressure"))
+        precip = _to_float(obs.get("precipitation"))  # often absent
+
+        lat = _to_float(obs.get("lat"))
+        lon = _to_float(obs.get("lng"))
+
+        rows.append({
+            "fonte": "GEONAMES_ICAO",
             "data": dt,
-            "temp": obs.get("temp"),
-            "humidade": obs.get("rh"),
-            "vento": obs.get("wind_spd"),
-            "pressao": obs.get("pres"),
-            "precipitacao": obs.get("precip"),
-            "lugar": obs.get("city_name") or WEATHERBIT_CITY,
-            "lat": obs.get("lat"),
-            "lon": obs.get("lon"),
-        }]
+            "temp": temp,
+            "humidade": hum,
+            "vento": wind,
+            "pressao": pres,
+            "precipitacao": precip,
+            "lugar": icao,
+            "lat": lat,
+            "lon": lon,
+        })
 
-    # IPMA
-    parsed: list[dict] = []
-    if isinstance(json_data, dict):
-        for timestamp, stations in json_data.items():
-            if not isinstance(stations, dict):
-                continue
-            ts_dt = _parse_ts_any(timestamp)
-            for station_id, values in stations.items():
-                if not isinstance(values, dict):
-                    continue
-                parsed.append({
-                    "fonte": "IPMA",
-                    "data": ts_dt,
-                    "temp": values.get("temperatura"),
-                    "humidade": values.get("humidade"),
-                    "vento": values.get("intensidadeVento"),
-                    "pressao": values.get("pressao"),
-                    "precipitacao": values.get("precAcumulada"),
-                    "lugar": str(station_id),
-                    "lat": None,
-                    "lon": None,
-                })
-    return parsed
+    return rows
 
 
 # ---------------- db_targets loader ----------------
@@ -420,7 +472,7 @@ def close_targets(handles: dict) -> None:
             pass
 
 
-# ---------------- DEDUPE + INSERT ----------------
+# ---------------- DEDUPE + INSERT (same as main.py) ----------------
 COLUMNS = ["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"]
 
 
@@ -446,7 +498,6 @@ def rows_to_tuples(rows: list[dict]) -> list[tuple]:
     return out
 
 
-# --- legacy day-based ---
 def sql_exists_day(handle: dict, fonte: str, day: date) -> bool:
     table = handle["table"]
     conn = handle["conn"]
@@ -475,7 +526,6 @@ def mongo_exists_day(handle: dict, fonte: str, day: date) -> bool:
     return col.find_one(q, {"_id": 1}) is not None
 
 
-# --- timestamp-based (NEW) ---
 def sql_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
     table = handle["table"]
     conn = handle["conn"]
@@ -555,7 +605,7 @@ def build_batches_by_fonte_ts(rows: list[dict]) -> dict[tuple[str, datetime], li
     return batches
 
 
-# ---------------- Email ----------------
+# ---------------- Email (same as main.py) ----------------
 def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | None = None) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
@@ -621,16 +671,22 @@ def pipeline_meteo(ctx: dict):
     errors: dict[str, str] = {}
 
     try:
-        data = request_data(ctx["api_url"])
+        data_list = request_data(ctx["api_url"])
         mon.mark("Data request successful!")
 
-        received = receive_data(data)
+        received = receive_data(data_list)
         mon.mark("Data reception successful!")
 
         rows = parse_data(received)
         if not rows:
             raise ValueError("Parsing devolveu 0 linhas (verifica a API / parse).")
         mon.mark(f"Parsing ({len(rows)} linhas)")
+
+        for j in received:
+            obs = j.get("weatherObservation") if isinstance(j, dict) else None
+            if isinstance(obs, dict) and obs.get("observation"):
+                icao = (obs.get("ICAO") or j.get("_requested_icao") or "").strip()
+                extra_lines.append(f"METAR {icao}: {obs.get('observation')}")
 
         targets = load_db_targets(ctx)
         mon.mark(f"Load DB targets ({len(targets)})")
@@ -647,7 +703,6 @@ def pipeline_meteo(ctx: dict):
             mon.mark(f"Data saved to file `{fp}`")
             return mon, extra_lines
 
-        # -------- DEDUPE + BATCHING --------
         if DEDUP_MODE == "date":
             batches = build_batches_by_fonte_day(rows)
             mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
@@ -686,11 +741,9 @@ def pipeline_meteo(ctx: dict):
                 skipped = 0
 
                 for (fonte, ts), batch_rows in batches.items():
-                    # normalize ts in rows
                     for r in batch_rows:
                         r["data"] = _ts_utc_naive(r.get("data"))
 
-                    # dedupe by (fonte, ts, lugar)
                     if h["type"] == "mongodb":
                         existing_lugares = mongo_existing_lugares_ts(h, fonte, ts)
                     else:
@@ -714,7 +767,6 @@ def pipeline_meteo(ctx: dict):
                 mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
 
         else:
-            # "none": always insert
             batches = build_batches_by_fonte_ts(rows)
             mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
 
