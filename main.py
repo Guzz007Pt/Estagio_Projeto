@@ -55,8 +55,11 @@ DEFAULT_EMAIL_TO = [e.strip() for e in os.getenv(
 
 DEFAULT_DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json")
 
-# Dedupe mode: "date" blocks re-inserting the same day for the same fonte
-DEDUP_MODE = os.getenv("PIPELINE_DEDUP_MODE", "date").strip().lower()
+# Dedupe mode:
+# - "timestamp": dedupe by (fonte, data timestamp, lugar)
+# - "date": dedupe by (fonte, day) (legacy)
+# - "none": always insert
+DEDUP_MODE = os.getenv("PIPELINE_DEDUP_MODE", "timestamp").strip().lower()
 
 # ---- API defaults: Weatherbit if key else IPMA ----
 WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "")
@@ -81,7 +84,6 @@ def get_context() -> dict:
 
 # ---------------- monitoring helper ----------------
 def _clts_watch_proc(dt_obj) -> tuple[float, float]:
-    # clts.deltat costuma devolver (watch, proc)
     if isinstance(dt_obj, (tuple, list)):
         w = float(dt_obj[0]) if len(dt_obj) > 0 else 0.0
         p = float(dt_obj[1]) if len(dt_obj) > 1 else 0.0
@@ -147,8 +149,6 @@ class StepMonitor:
         return rows
 
     def _header0(self) -> str:
-        # opcional: deixa-te pôr um header exatamente como o PCP via env var
-        # ex: PIPELINE_PCP_HEADER="Task(s) of TP16G2-PCP (176.223.60.34) | PCP | scripts | pcp_meteo_icao.py | -*."
         return os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {self.ctx['pipeline_name']} ({self.ctx['env']})."
 
     def html_table(self) -> str:
@@ -196,6 +196,17 @@ def _parse_ts_any(value) -> datetime:
             continue
 
     return datetime.now(timezone.utc)
+
+
+def _ts_utc_naive(value) -> datetime:
+    """
+    Normalize timestamp to UTC, drop microseconds, and store as naive datetime (UTC).
+    This makes equality checks stable across SQL/Mongo.
+    """
+    dt = value if isinstance(value, datetime) else _parse_ts_any(value)
+    dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    dt = dt.replace(microsecond=0)
+    return dt.replace(tzinfo=None)  # naive UTC
 
 
 def parse_data(json_data: dict) -> list[dict]:
@@ -397,6 +408,7 @@ def connect_targets(targets: list[dict], mon: StepMonitor | None = None) -> tupl
 
     return handles, errors
 
+
 def close_targets(handles: dict) -> None:
     for h in handles.values():
         try:
@@ -426,9 +438,15 @@ def build_insert_sql(table: str) -> str:
 
 
 def rows_to_tuples(rows: list[dict]) -> list[tuple]:
-    return [tuple(r.get(k) for k in COLUMNS) for r in rows]
+    out = []
+    for r in rows:
+        rr = dict(r)
+        rr["data"] = _ts_utc_naive(rr.get("data"))
+        out.append(tuple(rr.get(k) for k in COLUMNS))
+    return out
 
 
+# --- legacy day-based ---
 def sql_exists_day(handle: dict, fonte: str, day: date) -> bool:
     table = handle["table"]
     conn = handle["conn"]
@@ -449,6 +467,38 @@ def sql_exists_day(handle: dict, fonte: str, day: date) -> bool:
         cur.close()
 
 
+def mongo_exists_day(handle: dict, fonte: str, day: date) -> bool:
+    col = handle["col"]
+    day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    q = {"fonte": fonte, "data": {"$gte": day_start, "$lt": day_end}}
+    return col.find_one(q, {"_id": 1}) is not None
+
+
+# --- timestamp-based (NEW) ---
+def sql_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
+    table = handle["table"]
+    conn = handle["conn"]
+    ts = _ts_utc_naive(ts)
+
+    sql = f"SELECT lugar FROM {table} WHERE fonte=%s AND data=%s"
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, (fonte, ts))
+        rows = cur.fetchall() or []
+        return {str(r[0]) for r in rows if r and r[0] is not None}
+    finally:
+        cur.close()
+
+
+def mongo_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
+    col = handle["col"]
+    ts = _ts_utc_naive(ts)
+    q = {"fonte": fonte, "data": ts}
+    docs = col.find(q, {"lugar": 1, "_id": 0})
+    return {str(d.get("lugar")) for d in docs if d.get("lugar") is not None}
+
+
 def sql_insert_many(handle: dict, rows: list[dict]) -> None:
     table = handle["table"]
     conn = handle["conn"]
@@ -466,20 +516,13 @@ def sql_insert_many(handle: dict, rows: list[dict]) -> None:
         cur.close()
 
 
-def mongo_exists_day(handle: dict, fonte: str, day: date) -> bool:
-    col = handle["col"]
-    day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
-    q = {"fonte": fonte, "data": {"$gte": day_start, "$lt": day_end}}
-    return col.find_one(q, {"_id": 1}) is not None
-
-
 def mongo_insert_many(handle: dict, rows: list[dict]) -> None:
     col = handle["col"]
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()  # naive UTC
     docs = []
     for r in rows:
         d = dict(r)
+        d["data"] = _ts_utc_naive(d.get("data"))
         d["regdata"] = now
         docs.append(d)
     if docs:
@@ -500,6 +543,15 @@ def build_batches_by_fonte_day(rows: list[dict]) -> dict[tuple[str, date], list[
         fonte = r.get("fonte") or "UNKNOWN"
         day = _row_day_utc(r)
         batches.setdefault((fonte, day), []).append(r)
+    return batches
+
+
+def build_batches_by_fonte_ts(rows: list[dict]) -> dict[tuple[str, datetime], list[dict]]:
+    batches: dict[tuple[str, datetime], list[dict]] = {}
+    for r in rows:
+        fonte = r.get("fonte") or "UNKNOWN"
+        ts = _ts_utc_naive(r.get("data"))
+        batches.setdefault((fonte, ts), []).append(r)
     return batches
 
 
@@ -543,13 +595,11 @@ def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | Non
         if not smtp_user or not smtp_pass:
             raise RuntimeError("Faltam SMTP_USER / SMTP_PASS no .env")
 
-
         email_from = os.getenv("PIPELINE_EMAIL_FROM") or smtp_user or ctx["email_from"]
         if "From" in msg:
             msg.replace_header("From", email_from)
         else:
             msg["From"] = email_from
-
 
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.ehlo()
@@ -597,34 +647,92 @@ def pipeline_meteo(ctx: dict):
             mon.mark(f"Data saved to file `{fp}`")
             return mon, extra_lines
 
-        batches = build_batches_by_fonte_day(rows)
-        mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
+        # -------- DEDUPE + BATCHING --------
+        if DEDUP_MODE == "date":
+            batches = build_batches_by_fonte_day(rows)
+            mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
 
-        for target_name, h in handles.items():
-            inserted = 0
-            skipped = 0
+            for target_name, h in handles.items():
+                inserted = 0
+                skipped = 0
 
-            for (fonte, day), batch_rows in batches.items():
-                if h["type"] == "mongodb":
-                    exists = mongo_exists_day(h, fonte, day)
-                else:
-                    exists = sql_exists_day(h, fonte, day)
+                for (fonte, day), batch_rows in batches.items():
+                    if h["type"] == "mongodb":
+                        exists = mongo_exists_day(h, fonte, day)
+                    else:
+                        exists = sql_exists_day(h, fonte, day)
 
-                if exists and DEDUP_MODE == "date":
-                    skipped += len(batch_rows)
-                    mon.mark(f"... `{day}` skipped for {fonte} @ {target_name} (dedup)")
-                    continue
+                    if exists:
+                        skipped += len(batch_rows)
+                        mon.mark(f"... `{day}` skipped for {fonte} @ {target_name} (dedup date)")
+                        continue
 
-                if h["type"] == "mongodb":
-                    mongo_insert_many(h, batch_rows)
-                else:
-                    sql_insert_many(h, batch_rows)
+                    if h["type"] == "mongodb":
+                        mongo_insert_many(h, batch_rows)
+                    else:
+                        sql_insert_many(h, batch_rows)
 
-                inserted += len(batch_rows)
-                mon.mark(f"... `{day}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
+                    inserted += len(batch_rows)
+                    mon.mark(f"... `{day}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
 
-            # linha resumo (opcional, mas útil)
-            mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
+                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
+
+        elif DEDUP_MODE in ("timestamp", "ts"):
+            batches = build_batches_by_fonte_ts(rows)
+            mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
+
+            for target_name, h in handles.items():
+                inserted = 0
+                skipped = 0
+
+                for (fonte, ts), batch_rows in batches.items():
+                    # normalize ts in rows
+                    for r in batch_rows:
+                        r["data"] = _ts_utc_naive(r.get("data"))
+
+                    # dedupe by (fonte, ts, lugar)
+                    if h["type"] == "mongodb":
+                        existing_lugares = mongo_existing_lugares_ts(h, fonte, ts)
+                    else:
+                        existing_lugares = sql_existing_lugares_ts(h, fonte, ts)
+
+                    to_insert = [r for r in batch_rows if str(r.get("lugar")) not in existing_lugares]
+                    skipped += (len(batch_rows) - len(to_insert))
+
+                    if not to_insert:
+                        mon.mark(f"... `{ts}` skipped for {fonte} @ {target_name} (dedup timestamp)")
+                        continue
+
+                    if h["type"] == "mongodb":
+                        mongo_insert_many(h, to_insert)
+                    else:
+                        sql_insert_many(h, to_insert)
+
+                    inserted += len(to_insert)
+                    mon.mark(f"... `{ts}` inserted {len(to_insert)} row(s) for {fonte} @ {target_name}")
+
+                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
+
+        else:
+            # "none": always insert
+            batches = build_batches_by_fonte_ts(rows)
+            mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
+
+            for target_name, h in handles.items():
+                inserted = 0
+                for (fonte, ts), batch_rows in batches.items():
+                    for r in batch_rows:
+                        r["data"] = _ts_utc_naive(r.get("data"))
+
+                    if h["type"] == "mongodb":
+                        mongo_insert_many(h, batch_rows)
+                    else:
+                        sql_insert_many(h, batch_rows)
+
+                    inserted += len(batch_rows)
+                    mon.mark(f"... `{ts}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
+
+                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip=0")
 
     except Exception as e:
         mon.mark(f"Erro: {e}", "FAIL")
