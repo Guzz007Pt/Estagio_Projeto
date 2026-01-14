@@ -76,8 +76,24 @@ IPMA_STATION_IDS = [s.strip() for s in os.getenv("IPMA_STATION_IDS", "").split("
 
 IPMA_FETCH_STATIONS_META = os.getenv("IPMA_FETCH_STATIONS_META", "1").strip() == "1"
 
-_IPMA_STATION_MAP = None  # cache
+def _parse_station_names_env(s: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        sid, name = part.split(":", 1)
+        sid = sid.strip()
+        name = name.strip()
+        if sid and name:
+            out[sid] = name
+    return out
 
+
+
+
+IPMA_STATION_NAME_MAP = _parse_station_names_env(os.getenv("IPMA_STATION_NAMES", ""))
+_IPMA_STATION_MAP = None  # cache
 
 def get_context() -> dict:
     return {
@@ -263,10 +279,10 @@ def _get_ipma_station_map() -> dict[str, dict]:
 
 def parse_data(json_data: dict) -> list[dict]:
     """
-    Produces the same canonical rows your main pipeline expects:
+    Produz as mesmas rows q a pipeline principal:
       fonte, data(datetime), temp, humidade, vento, pressao, precipitacao, lugar, lat, lon
-    IPMA: lugar = station_id (string)
-    Optional filter: IPMA_STATION_IDS
+    IPMA: lugar = id + name string
+    filtro para n dar overflow: IPMA_STATION_IDS
     Optional fill: lat/lon via stations.json
     """
     station_map = _get_ipma_station_map()
@@ -289,6 +305,16 @@ def parse_data(json_data: dict) -> list[dict]:
                 continue
 
             meta = station_map.get(sid, {})
+
+            # prioridade: .env mapping primeiro, depois stations.json mapping, senao fallback ao sid
+            name_env = (IPMA_STATION_NAME_MAP.get(sid) or "").strip()
+            name_meta = (meta.get("name") or "").strip()
+            station_name = name_env or name_meta
+
+            lugar = sid
+            if station_name:
+                lugar = f"{sid} - {station_name}"
+
             parsed.append({
                 "fonte": "IPMA",
                 "data": ts_dt,
@@ -297,10 +323,11 @@ def parse_data(json_data: dict) -> list[dict]:
                 "vento": values.get("intensidadeVento"),
                 "pressao": values.get("pressao"),
                 "precipitacao": values.get("precAcumulada"),
-                "lugar": sid,
+                "lugar": lugar,          # <-- changed
                 "lat": meta.get("lat"),
                 "lon": meta.get("lon"),
             })
+
 
     return parsed
 
