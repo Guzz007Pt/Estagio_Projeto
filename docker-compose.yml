@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: meteo-pg
+    environment:
+      POSTGRES_USER: meteo
+      POSTGRES_PASSWORD: meteo
+      POSTGRES_DB: meteo
+    ports:
+      - "5432:5432"
+
+  mariadb:
+    image: mariadb:11
+    container_name: meteo-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpw
+      MARIADB_DATABASE: meteo
+      MARIADB_USER: meteo
+      MARIADB_PASSWORD: meteo
+    ports:
+      - "3306:3306"

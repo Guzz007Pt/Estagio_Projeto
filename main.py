@@ -556,10 +556,31 @@ def build_batches_by_fonte_ts(rows: list[dict]) -> dict[tuple[str, datetime], li
 
 
 # ---------------- Email ----------------
+def _send_via_resend(subject: str, html: str, email_from: str, email_to: list[str]) -> None:
+    api_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RESEND_API_KEY não configurada.")
+
+    from_addr = (os.getenv("RESEND_FROM") or "").strip() or email_from
+
+    payload = {
+        "from": from_addr,
+        "to": email_to,
+        "subject": subject,
+        "html": html,
+    }
+
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    r.raise_for_status()
+
+
 def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | None = None) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
-    msg["To"] = ", ".join(ctx["email_to"])
+    subject = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
 
     extra_info = (
         f"<p>Pipeline: <b>{ctx['pipeline_name']}</b> | Ambiente: <b>{ctx['env']}</b> | "
@@ -573,33 +594,44 @@ def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | Non
     if extra_lines:
         extra_info += "<br>" + "<br>".join(f"<p>{line}</p>" for line in extra_lines)
 
-    body = f"""
+    body_html = f"""
     <html>
     <body>
         <p><b>Resumo da execução da pipeline:</b></p>
         {extra_info}
         {mon.html_table()}
         <br>
-        <p>Data/hora de execução: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p>Data/hora de execução (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}</p>
     </body>
     </html>
     """
-    msg.attach(MIMEText(body, "html"))
 
+    # 1) Prefer Resend (Render free-safe)
     try:
+        if (os.getenv("RESEND_API_KEY") or "").strip():
+            email_from = os.getenv("PIPELINE_EMAIL_FROM") or ctx["email_from"]
+            _send_via_resend(subject, body_html, email_from=email_from, email_to=ctx["email_to"])
+            print("Email enviado com sucesso (Resend).")
+            return
+    except Exception as e:
+        print(f"Falha ao enviar email via Resend: {e}")
+
+    # 2) Fallback SMTP (local/colab)
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["To"] = ", ".join(ctx["email_to"])
+
         smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
         smtp_user = os.getenv("SMTP_USER")
         smtp_pass = os.getenv("SMTP_PASS")
-
         if not smtp_user or not smtp_pass:
-            raise RuntimeError("Faltam SMTP_USER / SMTP_PASS no .env")
+            raise RuntimeError("Faltam SMTP_USER / SMTP_PASS.")
 
         email_from = os.getenv("PIPELINE_EMAIL_FROM") or smtp_user or ctx["email_from"]
-        if "From" in msg:
-            msg.replace_header("From", email_from)
-        else:
-            msg["From"] = email_from
+        msg["From"] = email_from
+        msg.attach(MIMEText(body_html, "html"))
 
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.ehlo()
@@ -608,9 +640,9 @@ def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | Non
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
 
-        print("Email enviado com sucesso.")
+        print("Email enviado com sucesso (SMTP).")
     except Exception as e:
-        print(f"Falha ao enviar email: {e}")
+        print(f"Falha ao enviar email (SMTP): {e}")
 
 
 # ---------------- Pipeline ----------------
