@@ -1,24 +1,15 @@
 import os
 import json
-import requests
 import time
-from datetime import datetime, timezone, timedelta, date
-from urllib.parse import urlparse, unquote
-from tabulate import tabulate
+import csv
+import requests
 import smtplib
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, unquote
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import pandas as pd
-from dotenv import load_dotenv
 
-# ---------- optional monitoring (clts_pcp) ----------
-try:
-    import clts_pcp as clts  # pip install clts_pcp
-    HAS_CLTS = True
-except Exception:
-    HAS_CLTS = False
-
-# ---------- DB drivers ----------
+# Optional libs (only if installed)
 try:
     import psycopg2  # pip install psycopg2-binary
     HAS_PG = True
@@ -43,188 +34,129 @@ try:
 except Exception:
     HAS_MONGO = False
 
+try:
+    from tabulate import tabulate  # pip install tabulate
+    HAS_TABULATE = True
+except Exception:
+    HAS_TABULATE = False
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-DEFAULT_PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-METEO")
-DEFAULT_EMAIL_FROM = os.getenv("PIPELINE_EMAIL_FROM", "estagio.pipeline@example.com")
-DEFAULT_EMAIL_TO = [e.strip() for e in os.getenv(
-    "PIPELINE_EMAIL_TO",
-    "pedro.pimenta@cm-maia.pt,gustavo.sa.martins@gmail.com"
-).split(",") if e.strip()]
 
-DEFAULT_DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json")
+# =========================
+# Config / Context
+# =========================
+PIPELINE_NAME = os.getenv("PIPELINE_NAME", "GM-METEO")
+PIPELINE_ENV = os.getenv("PIPELINE_ENV", "local")
+PIPELINE_USER = os.getenv("PIPELINE_USER", "gustavo")
 
-# Dedupe mode:
-# - "timestamp": dedupe by (fonte, data timestamp, lugar)
-# - "date": dedupe by (fonte, day) (legacy)
-# - "none": always insert
-DEDUP_MODE = os.getenv("PIPELINE_DEDUP_MODE", "timestamp").strip().lower()
+EMAIL_FROM_DEFAULT = os.getenv("PIPELINE_EMAIL_FROM", "estagio.pipeline@example.com")
+EMAIL_TO_DEFAULT = [
+    e.strip() for e in os.getenv(
+        "PIPELINE_EMAIL_TO",
+        "pedro.pimenta@cm-maia.pt,gustavo.sa.martins@gmail.com"
+    ).split(",")
+    if e.strip()
+]
 
-# ---- API defaults: Weatherbit if key else IPMA ----
+DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json")
+
+
 WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "")
 WEATHERBIT_CITY = os.getenv("WEATHERBIT_CITY", "Maia,PT")
 WEATHERBIT_URL = f"https://api.weatherbit.io/v2.0/current?city={WEATHERBIT_CITY}&key={WEATHERBIT_KEY}"
 IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
-DEFAULT_API_URL = os.getenv("PIPELINE_API_URL", WEATHERBIT_URL if WEATHERBIT_KEY else IPMA_URL)
+API_URL = os.getenv("PIPELINE_API_URL", WEATHERBIT_URL if WEATHERBIT_KEY else IPMA_URL)
+
+DASHBOARD_URL = os.getenv("PIPELINE_DASHBOARD_URL_METEO", "")
+
+ctx = {
+    "pipeline_name": PIPELINE_NAME,
+    "env": PIPELINE_ENV,
+    "user": PIPELINE_USER,
+    "api_url": API_URL,
+    "email_from": EMAIL_FROM_DEFAULT,
+    "email_to": EMAIL_TO_DEFAULT,
+    "dashboard_url": DASHBOARD_URL,
+    "db_targets_file": DB_TARGETS_FILE,
+}
+
+print(f"Iniciando pipeline '{ctx['pipeline_name']}' (env={ctx['env']}, user={ctx['user']})...")
 
 
-def get_context() -> dict:
-    return {
-        "pipeline_name": DEFAULT_PIPELINE_NAME,
-        "env": os.getenv("PIPELINE_ENV", "local"),
-        "user": os.getenv("PIPELINE_USER", "gustavo"),
-        "api_url": DEFAULT_API_URL,
-        "email_from": DEFAULT_EMAIL_FROM,
-        "email_to": DEFAULT_EMAIL_TO,
-        "dashboard_url": os.getenv("PIPELINE_DASHBOARD_URL_METEO", ""),
-        "db_targets_file": DEFAULT_DB_TARGETS_FILE,
-    }
+# =========================
+# Simple monitoring
+# =========================
+steps = []
+w_prev = time.perf_counter()
+p_prev = time.process_time()
 
+extra_lines = []
+handles = {}
+errors = {}
 
-# ---------------- monitoring helper ----------------
-def _clts_watch_proc(dt_obj) -> tuple[float, float]:
-    if isinstance(dt_obj, (tuple, list)):
-        w = float(dt_obj[0]) if len(dt_obj) > 0 else 0.0
-        p = float(dt_obj[1]) if len(dt_obj) > 1 else 0.0
-        return w, p
-    if isinstance(dt_obj, dict):
-        w = float(dt_obj.get("watch", dt_obj.get("watch_time", dt_obj.get("elapsed", 0.0))) or 0.0)
-        p = float(dt_obj.get("proc", dt_obj.get("proc_time", 0.0)) or 0.0)
-        return w, p
-    try:
-        return float(dt_obj), 0.0
-    except Exception:
-        return 0.0, 0.0
-
-
-class StepMonitor:
-    def __init__(self, ctx: dict):
-        self.ctx = ctx
-        self.summary: list[dict] = []  # {"step","status","watch","proc"}
-        self.use_clts = HAS_CLTS and os.getenv("USE_CLTS_PCP", "0") == "1"
-
-        self._w_prev = time.perf_counter()
-        self._p_prev = time.process_time()
-
-        if self.use_clts:
-            clts.setcontext(f"{ctx['pipeline_name']} ({ctx['env']})")
-            self._ts_prev = clts.getts()
-
-    def mark(self, step: str, status: str = "", seconds_override: float | None = None) -> float:
-        if seconds_override is not None:
-            watch = float(seconds_override)
-            proc = 0.0
-        elif self.use_clts:
-            dt = clts.deltat(self._ts_prev)
-            watch, proc = _clts_watch_proc(dt)
-            self._ts_prev = clts.getts()
-        else:
-            w_now = time.perf_counter()
-            p_now = time.process_time()
-            watch = w_now - self._w_prev
-            proc = p_now - self._p_prev
-            self._w_prev = w_now
-            self._p_prev = p_now
-
-        self.summary.append({"step": str(step), "status": str(status), "watch": float(watch), "proc": float(proc)})
-        return float(watch)
-
-    def pcp_rows_total(self) -> list[list]:
-        w_total = 0.0
-        p_total = 0.0
-        rows: list[list] = []
-
-        for r in self.summary:
-            w_total += r["watch"]
-            p_total += r["proc"]
-
-            label = r["step"]
-            if r["status"]:
-                label = f"{label} ({r['status']})"
-
-            rows.append([label, round(w_total, 2), round(p_total, 2)])
-
-        rows.append(["Overall (before email):", round(w_total, 2), round(p_total, 2)])
-        return rows
-
-    def _header0(self) -> str:
-        return os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {self.ctx['pipeline_name']} ({self.ctx['env']})."
-
-    def html_table(self) -> str:
-        return tabulate(
-            self.pcp_rows_total(),
-            headers=[self._header0(), "watch time (secs)", "proc time (secs)"],
-            tablefmt="html",
-        )
-
-
-# ---------------- API fetch / parse ----------------
-def request_data(api_url: str) -> dict:
-    resp = requests.get(api_url, timeout=20)
+try:
+    # =========================
+    # 1) Request data
+    # =========================
+    resp = requests.get(ctx["api_url"], timeout=20)
     resp.raise_for_status()
-    return resp.json()
+    json_data = resp.json()
 
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str("Data request successful!"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
-def receive_data(json_data: dict) -> dict:
     if not json_data:
         raise ValueError("JSON vazio ou inválido")
-    return json_data
+    received = json_data
 
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str("Data reception successful!"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
-def _parse_ts_any(value) -> datetime:
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
+    # =========================
+    # 2) Parse to canonical rows
+    # =========================
+    rows = []
 
-    s = str(value).strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+    # Weatherbit shape: {"data":[{...}]}
+    if isinstance(received, dict) and "data" in received and isinstance(received["data"], list) and received["data"]:
+        obs = received["data"][0]
 
-    try:
-        dt = datetime.fromisoformat(s)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        pass
-
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-    return datetime.now(timezone.utc)
-
-
-def _ts_utc_naive(value) -> datetime:
-    """
-    Normalize timestamp to UTC, drop microseconds, and store as naive datetime (UTC).
-    This makes equality checks stable across SQL/Mongo.
-    """
-    dt = value if isinstance(value, datetime) else _parse_ts_any(value)
-    dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    dt = dt.replace(microsecond=0)
-    return dt.replace(tzinfo=None)  # naive UTC
-
-
-def parse_data(json_data: dict) -> list[dict]:
-    """
-    Canonical row format (works for every DB target):
-      fonte, data(datetime), temp, humidade, vento, pressao, precipitacao, lugar, lat, lon
-    """
-    # Weatherbit
-    if isinstance(json_data, dict) and "data" in json_data and isinstance(json_data["data"], list) and json_data["data"]:
-        obs = json_data["data"][0]
+        # Parse timestamp
+        dt = None
         if "ob_time" in obs:
-            dt = _parse_ts_any(obs["ob_time"])
-        elif "ts" in obs:
-            dt = _parse_ts_any(int(obs["ts"]))
-        else:
+            s = str(obs["ob_time"]).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except Exception:
+                dt = None
+
+        if dt is None and "ts" in obs:
+            try:
+                dt = datetime.fromtimestamp(int(obs["ts"]), tz=timezone.utc)
+            except Exception:
+                dt = None
+
+        if dt is None:
             dt = datetime.now(timezone.utc)
 
-        return [{
+        rows.append({
             "fonte": "WEATHERBIT",
             "data": dt,
             "temp": obs.get("temp"),
@@ -235,127 +167,191 @@ def parse_data(json_data: dict) -> list[dict]:
             "lugar": obs.get("city_name") or WEATHERBIT_CITY,
             "lat": obs.get("lat"),
             "lon": obs.get("lon"),
-        }]
+        })
 
-    # IPMA
-    parsed: list[dict] = []
-    if isinstance(json_data, dict):
-        for timestamp, stations in json_data.items():
-            if not isinstance(stations, dict):
-                continue
-            ts_dt = _parse_ts_any(timestamp)
-            for station_id, values in stations.items():
-                if not isinstance(values, dict):
+    # IPMA shape: { "<timestamp>": { "<station_id>": {...}, ... }, ... }
+    else:
+        if isinstance(received, dict):
+            for timestamp, stations in received.items():
+                if not isinstance(stations, dict):
                     continue
-                parsed.append({
-                    "fonte": "IPMA",
-                    "data": ts_dt,
-                    "temp": values.get("temperatura"),
-                    "humidade": values.get("humidade"),
-                    "vento": values.get("intensidadeVento"),
-                    "pressao": values.get("pressao"),
-                    "precipitacao": values.get("precAcumulada"),
-                    "lugar": str(station_id),
-                    "lat": None,
-                    "lon": None,
-                })
-    return parsed
 
+                # parse timestamp key
+                ts_dt = None
+                s = str(timestamp).strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
 
-# ---------------- db_targets loader ----------------
-def _safe_ident(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Nome de tabela vazio.")
-    if not all(c.isalnum() or c == "_" for c in name):
-        raise ValueError(f"Nome de tabela inválido: {name!r}")
-    return name
+                try:
+                    ts_dt = datetime.fromisoformat(s)
+                except Exception:
+                    ts_dt = None
 
+                if ts_dt is None:
+                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                        try:
+                            ts_dt = datetime.strptime(str(timestamp).strip(), fmt).replace(tzinfo=timezone.utc)
+                            break
+                        except Exception:
+                            continue
 
-def _get_env_or_value(obj: dict, value_key: str, env_key_key: str) -> str:
-    v = obj.get(value_key)
-    if isinstance(v, str) and v.strip():
-        return v.strip()
-    env_name = obj.get(env_key_key)
-    if isinstance(env_name, str) and env_name.strip():
-        return os.getenv(env_name.strip(), "").strip()
-    return ""
+                if ts_dt is None:
+                    ts_dt = datetime.now(timezone.utc)
 
+                for station_id, values in stations.items():
+                    if not isinstance(values, dict):
+                        continue
+                    rows.append({
+                        "fonte": "IPMA",
+                        "data": ts_dt,
+                        "temp": values.get("temperatura"),
+                        "humidade": values.get("humidade"),
+                        "vento": values.get("intensidadeVento"),
+                        "pressao": values.get("pressao"),
+                        "precipitacao": values.get("precAcumulada"),
+                        "lugar": str(station_id),
+                        "lat": None,
+                        "lon": None,
+                    })
 
-def load_db_targets(ctx: dict) -> list[dict]:
+    if not rows:
+        raise ValueError("Parsing devolveu 0 linhas (verifica a API / parse).")
+
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str(f"Parsing ({len(rows)} linhas)"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
+
+    # =========================
+    # 3) Normalize timestamps (UTC naive, no microseconds)
+    # =========================
+    for r in rows:
+        v = r.get("data")
+        dt = None
+
+        if isinstance(v, datetime):
+            dt = v
+        elif isinstance(v, (int, float)):
+            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+        else:
+            s = str(v).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except Exception:
+                dt = None
+            if dt is None:
+                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                        break
+                    except Exception:
+                        continue
+            if dt is None:
+                dt = datetime.now(timezone.utc)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+        r["data"] = dt.replace(tzinfo=None)  # naive UTC for DB compatibility
+
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str("Normalize timestamps"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
+
+    # =========================
+    # 4) Load DB targets
+    # =========================
     path = ctx["db_targets_file"]
     if not path or not os.path.exists(path):
-        raise ValueError(f"Ficheiro de targets não encontrado: {path!r}")
+        raise ValueError(f"Ficheiro de targets não  encontrado: {path!r}")
 
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    targets = raw["targets"] if isinstance(raw, dict) and "targets" in raw else raw
-    if not isinstance(targets, list):
+    targets_raw = raw["targets"] if isinstance(raw, dict) and "targets" in raw else raw
+    if not isinstance(targets_raw, list):
         raise ValueError("db_targets.json inválido: esperado lista ou {'targets':[...]}")
 
-    norm: list[dict] = []
-    for i, t in enumerate(targets, start=1):
+    targets = []
+
+    for i, t in enumerate(targets_raw, start=1):
         if not isinstance(t, dict):
             continue
 
         ttype = (t.get("type") or "postgres").strip().lower()
         name = t.get("name") or f"db{i}"
 
-        if ttype in ("postgres", "cockroachdb", "yugabyte", "supabase", "neon", "aiven_pg"):
-            dsn = _get_env_or_value(t, "dsn", "dsn_env")
-            table = _safe_ident(t.get("table", "meteo"))
-            norm.append({"name": name, "type": "postgres", "dsn": dsn, "table": table})
+        if ttype in ("postgres", "cockroachdb", "yugabyte", "supabase", "neon", "aiven_pg", "cratedb"):
+            dsn = (t.get("dsn") or "").strip()
+            if not dsn and isinstance(t.get("dsn_env"), str) and t["dsn_env"].strip():
+                dsn = os.getenv(t["dsn_env"].strip(), "").strip()
 
-        elif ttype in ("cratedb",):
-            dsn = _get_env_or_value(t, "dsn", "dsn_env")
-            table = _safe_ident(t.get("table", "meteo"))
-            norm.append({"name": name, "type": "cratedb", "dsn": dsn, "table": table})
+            table = (t.get("table") or "meteo").strip()
+            if not table or not all(c.isalnum() or c == "_" for c in table):
+                raise ValueError(f"Nome de tabela inválido: {table!r}")
+
+            targets.append({
+                "name": name,
+                "type": "postgres" if ttype != "cratedb" else "cratedb",
+                "dsn": dsn,
+                "table": table
+            })
 
         elif ttype in ("mysql", "mariadb", "tidb", "tidbcloud"):
-            dsn = _get_env_or_value(t, "dsn", "dsn_env")
-            table = _safe_ident(t.get("table", "meteo"))
-            norm.append({"name": name, "type": "mysql", "dsn": dsn, "table": table})
+            dsn = (t.get("dsn") or "").strip()
+            if not dsn and isinstance(t.get("dsn_env"), str) and t["dsn_env"].strip():
+                dsn = os.getenv(t["dsn_env"].strip(), "").strip()
+
+            table = (t.get("table") or "meteo").strip()
+            if not table or not all(c.isalnum() or c == "_" for c in table):
+                raise ValueError(f"Nome de tabela inválido: {table!r}")
+
+            targets.append({"name": name, "type": "mysql", "dsn": dsn, "table": table})
 
         elif ttype in ("mongodb", "mongo"):
-            uri = _get_env_or_value(t, "uri", "uri_env")
+            uri = (t.get("uri") or "").strip()
+            if not uri and isinstance(t.get("uri_env"), str) and t["uri_env"].strip():
+                uri = os.getenv(t["uri_env"].strip(), "").strip()
+
             database = (t.get("database") or "meteo").strip()
             collection = (t.get("collection") or "meteo").strip()
-            norm.append({"name": name, "type": "mongodb", "uri": uri, "database": database, "collection": collection})
+
+            targets.append({"name": name, "type": "mongodb", "uri": uri, "database": database, "collection": collection})
 
         else:
             raise ValueError(f"Tipo de target desconhecido ({name}): {ttype!r}")
 
-    return norm
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str(f"Load DB targets ({len(targets)})"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
-
-# ---------------- DB connection helpers ----------------
-def _parse_mysql_dsn(dsn: str) -> dict:
-    p = urlparse(dsn)
-    if p.scheme not in ("mysql", "mariadb"):
-        raise ValueError(f"MySQL DSN inválido: {dsn!r}")
-
-    user = unquote(p.username or "")
-    password = unquote(p.password or "")
-    host = p.hostname or ""
-    port = p.port or 3306
-    dbname = (p.path or "").lstrip("/")
-    if not host or not dbname:
-        raise ValueError("MySQL DSN precisa de host e dbname.")
-
-    return {"host": host, "port": port, "user": user, "password": password, "database": dbname}
-
-
-def connect_targets(targets: list[dict], mon: StepMonitor | None = None) -> tuple[dict, dict]:
-    handles: dict[str, dict] = {}
-    errors: dict[str, str] = {}
+    # =========================
+    # 5) Connect targets
+    # =========================
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str("Starting database accesses:"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
     for t in targets:
         name = t["name"]
         ttype = t["type"]
-
-        if mon:
-            mon.mark(f"Connecting to `{name}`")
 
         try:
             if ttype in ("postgres", "cratedb"):
@@ -372,7 +368,19 @@ def connect_targets(targets: list[dict], mon: StepMonitor | None = None) -> tupl
                 if not dsn:
                     raise RuntimeError("DSN vazio (dsn/dsn_env).")
 
-                mysql_kwargs = _parse_mysql_dsn(dsn)
+                p = urlparse(dsn)
+                if p.scheme not in ("mysql", "mariadb"):
+                    raise ValueError(f"MySQL DSN inválido: {dsn!r}")
+
+                user = unquote(p.username or "")
+                password = unquote(p.password or "")
+                host = p.hostname or ""
+                port = p.port or 3306
+                dbname = (p.path or "").lstrip("/")
+                if not host or not dbname:
+                    raise ValueError("MySQL DSN precisa de host e dbname.")
+
+                mysql_kwargs = {"host": host, "port": port, "user": user, "password": password, "database": dbname}
 
                 if HAS_PYMYSQL:
                     conn = pymysql.connect(**mysql_kwargs, autocommit=False)
@@ -398,193 +406,209 @@ def connect_targets(targets: list[dict], mon: StepMonitor | None = None) -> tupl
             else:
                 raise RuntimeError(f"type não suportado: {ttype}")
 
-            if mon:
-                mon.mark(f"... connected to `{name}`")
+            w_now = time.perf_counter()
+            p_now = time.process_time()
+            watch = w_now - w_prev
+            proc = p_now - p_prev
+            w_prev = w_now
+            p_prev = p_now
+            steps.append({'step': str(f"... connected to `{name}`"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
         except Exception as e:
             errors[name] = str(e)
-            if mon:
-                mon.mark(f"... failed to connect to `{name}`: {e}", "FAIL")
+            w_now = time.perf_counter()
+            p_now = time.process_time()
+            watch = w_now - w_prev
+            proc = p_now - p_prev
+            w_prev = w_now
+            p_prev = p_now
+            steps.append({'step': str(f"... failed to connect to `{name}`: {e}"), 'status': str("FAIL"), 'watch': float(watch), 'proc': float(proc)})
 
-    return handles, errors
+    extra_lines.append(f"Targets ligados: {', '.join(handles.keys()) if handles else '(nenhum)'}")
+    if errors:
+        extra_lines.append("Targets com erro: " + "; ".join([f"{k}={v}" for k, v in errors.items()]))
 
+    # =========================
+    # 6) If no DB, offline CSV
+    # =========================
+    # if not handles:
+    #     os.makedirs("offline_output", exist_ok=True)
+    #     fp = f"offline_output/meteo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    #     with open(fp, "w", newline="", encoding="utf-8") as f:
+    #         w = csv.DictWriter(f, fieldnames=["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"])
+    #         w.writeheader()
+    #         for r in rows:
+    #             w.writerow(r)
 
-def close_targets(handles: dict) -> None:
-    for h in handles.values():
-        try:
-            if h["type"] in ("postgres", "cratedb", "mysql"):
-                h["conn"].close()
-            elif h["type"] == "mongodb":
-                h["client"].close()
-        except Exception:
-            pass
+    #     w_now = time.perf_counter()
+    #     p_now = time.process_time()
+    #     watch = w_now - w_prev
+    #     proc = p_now - p_prev
+    #     w_prev = w_now
+    #     p_prev = p_now
+    #     steps.append({'step': str(f"Data saved to file `{fp}`"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
+    #     extra_lines.append(f"Offline file: {fp}")
 
+    # =========================
+    # 7) Dedup + insert
+    # =========================
 
-# ---------------- DEDUPE + INSERT ----------------
-COLUMNS = ["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"]
+    COLUMNS = ["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"]
 
-
-def _row_day_utc(r: dict) -> date:
-    dt = r["data"]
-    dt = dt if isinstance(dt, datetime) else _parse_ts_any(dt)
-    dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    return dt.date()
-
-
-def build_insert_sql(table: str) -> str:
-    cols_sql = ", ".join(COLUMNS + ["regdata"])
-    ph = ", ".join(["%s"] * len(COLUMNS) + ["CURRENT_TIMESTAMP"])
-    return f"INSERT INTO {table} ({cols_sql}) VALUES ({ph})"
-
-
-def rows_to_tuples(rows: list[dict]) -> list[tuple]:
-    out = []
+    # group rows by (fonte, timestamp)
+    batches = {}
     for r in rows:
-        rr = dict(r)
-        rr["data"] = _ts_utc_naive(rr.get("data"))
-        out.append(tuple(rr.get(k) for k in COLUMNS))
-    return out
+        fonte = r.get("fonte") or "UNKNOWN"
+        ts = r.get("data")
+        key = (fonte, ts)
+        if key not in batches:
+            batches[key] = []
+        batches[key].append(r)
 
+    # log batch count (optional)
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str(f"Batching por fonte+timestamp ({len(batches)} batches)"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
-# --- legacy day-based ---
-def sql_exists_day(handle: dict, fonte: str, day: date) -> bool:
-    table = handle["table"]
-    conn = handle["conn"]
-    ttype = handle["type"]
+    for target_name, h in handles.items():
+        inserted = 0
+        skipped = 0
 
-    if ttype == "mysql":
-        sql = f"SELECT 1 FROM {table} WHERE fonte=%s AND DATE(data)=%s LIMIT 1"
-        params = (fonte, day)
-    else:
-        sql = f"SELECT 1 FROM {table} WHERE fonte=%s AND CAST(data AS DATE)=%s LIMIT 1"
-        params = (fonte, day)
+        for (fonte, ts), batch_rows in batches.items():
 
-    cur = conn.cursor()
+            # get existing lugares for (fonte, ts)
+            if h["type"] == "mongodb":
+                q = {"fonte": fonte, "data": ts}
+                docs = h["col"].find(q, {"lugar": 1, "_id": 0})
+                existing_lugares = set()
+                for d in docs:
+                    if d.get("lugar") is not None:
+                        existing_lugares.add(str(d.get("lugar")))
+            else:
+                table = h["table"]
+                conn = h["conn"]
+                sql = f"SELECT lugar FROM {table} WHERE fonte=%s AND data=%s"
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, (fonte, ts))
+                    rs = cur.fetchall() or []
+                    existing_lugares = set()
+                    for rr in rs:
+                        if rr and rr[0] is not None:
+                            existing_lugares.add(str(rr[0]))
+                finally:
+                    cur.close()
+
+            # filter rows that are new by lugar
+            to_insert = []
+            for r in batch_rows:
+                if str(r.get("lugar")) not in existing_lugares:
+                    to_insert.append(r)
+
+            skipped += (len(batch_rows) - len(to_insert))
+            if not to_insert:
+                continue
+
+            # insert
+            if h["type"] == "mongodb":
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                docs = []
+                for r in to_insert:
+                    d = dict(r)
+                    d["regdata"] = now
+                    docs.append(d)
+                h["col"].insert_many(docs, ordered=False)
+
+            else:
+                table = h["table"]
+                conn = h["conn"]
+                cols_sql = ", ".join(COLUMNS + ["regdata"])
+                ph = ", ".join(["%s"] * len(COLUMNS) + ["CURRENT_TIMESTAMP"])
+                insert_sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({ph})"
+
+                values = []
+                for r in to_insert:
+                    values.append(tuple(r.get(c) for c in COLUMNS))
+
+                cur = conn.cursor()
+                try:
+                    cur.executemany(insert_sql, values)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    cur.close()
+
+            inserted += len(to_insert)
+
+        w_now = time.perf_counter()
+        p_now = time.process_time()
+        watch = w_now - w_prev
+        proc = p_now - p_prev
+        w_prev = w_now
+        p_prev = p_now
+        steps.append({'step': str(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
+
+finally:
+    # =========================
+    # Close targets
+    # =========================
     try:
-        cur.execute(sql, params)
-        return cur.fetchone() is not None
-    finally:
-        cur.close()
+        for h in handles.values():
+            try:
+                if h["type"] in ("postgres", "cratedb", "mysql"):
+                    h["conn"].close()
+                elif h["type"] == "mongodb":
+                    h["client"].close()
+            except Exception:
+                pass
 
-
-def mongo_exists_day(handle: dict, fonte: str, day: date) -> bool:
-    col = handle["col"]
-    day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
-    q = {"fonte": fonte, "data": {"$gte": day_start, "$lt": day_end}}
-    return col.find_one(q, {"_id": 1}) is not None
-
-
-# --- timestamp-based (NEW) ---
-def sql_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
-    table = handle["table"]
-    conn = handle["conn"]
-    ts = _ts_utc_naive(ts)
-
-    sql = f"SELECT lugar FROM {table} WHERE fonte=%s AND data=%s"
-    cur = conn.cursor()
-    try:
-        cur.execute(sql, (fonte, ts))
-        rows = cur.fetchall() or []
-        return {str(r[0]) for r in rows if r and r[0] is not None}
-    finally:
-        cur.close()
-
-
-def mongo_existing_lugares_ts(handle: dict, fonte: str, ts: datetime) -> set[str]:
-    col = handle["col"]
-    ts = _ts_utc_naive(ts)
-    q = {"fonte": fonte, "data": ts}
-    docs = col.find(q, {"lugar": 1, "_id": 0})
-    return {str(d.get("lugar")) for d in docs if d.get("lugar") is not None}
-
-
-def sql_insert_many(handle: dict, rows: list[dict]) -> None:
-    table = handle["table"]
-    conn = handle["conn"]
-    insert_sql = build_insert_sql(table)
-    values = rows_to_tuples(rows)
-
-    cur = conn.cursor()
-    try:
-        cur.executemany(insert_sql, values)
-        conn.commit()
+        w_now = time.perf_counter()
+        p_now = time.process_time()
+        watch = w_now - w_prev
+        proc = p_now - p_prev
+        w_prev = w_now
+        p_prev = p_now
+        steps.append({'step': str("Fecho targets"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
     except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
+        pass
 
-
-def mongo_insert_many(handle: dict, rows: list[dict]) -> None:
-    col = handle["col"]
-    now = datetime.now(timezone.utc)  # naive UTC
-    docs = []
-    for r in rows:
-        d = dict(r)
-        d["data"] = _ts_utc_naive(d.get("data"))
-        d["regdata"] = now
-        docs.append(d)
-    if docs:
-        col.insert_many(docs, ordered=False)
-
-
-def offline_dump(rows: list[dict]) -> str:
-    df = pd.DataFrame(rows)
-    os.makedirs("offline_output", exist_ok=True)
-    fp = f"offline_output/meteo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    df.to_csv(fp, index=False)
-    return fp
-
-
-def build_batches_by_fonte_day(rows: list[dict]) -> dict[tuple[str, date], list[dict]]:
-    batches: dict[tuple[str, date], list[dict]] = {}
-    for r in rows:
-        fonte = r.get("fonte") or "UNKNOWN"
-        day = _row_day_utc(r)
-        batches.setdefault((fonte, day), []).append(r)
-    return batches
-
-
-def build_batches_by_fonte_ts(rows: list[dict]) -> dict[tuple[str, datetime], list[dict]]:
-    batches: dict[tuple[str, datetime], list[dict]] = {}
-    for r in rows:
-        fonte = r.get("fonte") or "UNKNOWN"
-        ts = _ts_utc_naive(r.get("data"))
-        batches.setdefault((fonte, ts), []).append(r)
-    return batches
-
-
-# ---------------- Email ----------------
-def _send_via_resend(subject: str, html: str, email_from: str, email_to: list[str]) -> None:
-    api_key = (os.getenv("RESEND_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("RESEND_API_KEY não configurada.")
-
-    from_addr = (os.getenv("RESEND_FROM") or "").strip() or email_from
-
-    payload = {
-        "from": from_addr,
-        "to": email_to,
-        "subject": subject,
-        "html": html,
-    }
-
-    r = requests.post(
-        "https://api.resend.com/emails",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=20,
-    )
-    r.raise_for_status()
-
-
-def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | None = None) -> None:
+    # =========================
+    # Build HTML summary
+    # =========================
     subject = f"Pipeline {ctx['pipeline_name']} - Relatório de Execução ({ctx['env']})"
+    header0 = os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {ctx['pipeline_name']} ({ctx['env']})."
+
+    w_total = 0.0
+    p_total = 0.0
+    rows_tbl = []
+    for r in steps:
+        w_total += r["watch"]
+        p_total += r["proc"]
+        label = r["step"]
+        if r["status"]:
+            label = f"{label} ({r['status']})"
+        rows_tbl.append([label, round(w_total, 2), round(p_total, 2)])
+    rows_tbl.append(["Overall (before email):", round(w_total, 2), round(p_total, 2)])
+
+    if HAS_TABULATE:
+        table_html = tabulate(rows_tbl, headers=[header0, "watch time (secs)", "proc time (secs)"], tablefmt="html")
+        table_txt = tabulate(rows_tbl, headers=[header0, "watch time (secs)", "proc time (secs)"])
+    else:
+        table_html = "<table border='1' cellpadding='4' cellspacing='0'>"
+        table_html += f"<tr><th>{header0}</th><th>watch time (secs)</th><th>proc time (secs)</th></tr>"
+        for rr in rows_tbl:
+            table_html += f"<tr><td>{rr[0]}</td><td>{rr[1]}</td><td>{rr[2]}</td></tr>"
+        table_html += "</table>"
+        table_txt = "\n".join([f"{rr[0]} | {rr[1]} | {rr[2]}" for rr in rows_tbl])
 
     extra_info = (
         f"<p>Pipeline: <b>{ctx['pipeline_name']}</b> | Ambiente: <b>{ctx['env']}</b> | "
-        f"Utilizador lógico: <b>{ctx['user']}</b> | DEDUP_MODE: <b>{DEDUP_MODE}</b></p>"
     )
 
     if ctx.get("dashboard_url"):
@@ -599,196 +623,63 @@ def send_summary_email(ctx: dict, mon: StepMonitor, extra_lines: list[str] | Non
     <body>
         <p><b>Resumo da execução da pipeline:</b></p>
         {extra_info}
-        {mon.html_table()}
+        {table_html}
         <br>
         <p>Data/hora de execução (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}</p>
     </body>
     </html>
     """
 
-    # 1) Prefer Resend (Render free-safe)
-    try:
-        if (os.getenv("RESEND_API_KEY") or "").strip():
-            email_from = os.getenv("PIPELINE_EMAIL_FROM") or ctx["email_from"]
-            _send_via_resend(subject, body_html, email_from=email_from, email_to=ctx["email_to"])
-            print("Email enviado com sucesso (Resend).")
-            return
-    except Exception as e:
-        print(f"Falha ao enviar email via Resend: {e}")
+    # =========================
+    # Send email (Resend -> SMTP fallback)
+    # =========================
+    resend_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    resend_from = (os.getenv("RESEND_FROM") or "").strip() or ctx["email_from"]
 
-    # 2) Fallback SMTP (local/colab)
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["To"] = ", ".join(ctx["email_to"])
+    sent_ok = False
 
-        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        smtp_user = os.getenv("SMTP_USER")
-        smtp_pass = os.getenv("SMTP_PASS")
-        if not smtp_user or not smtp_pass:
-            raise RuntimeError("Faltam SMTP_USER / SMTP_PASS.")
-
-        email_from = os.getenv("PIPELINE_EMAIL_FROM") or smtp_user or ctx["email_from"]
-        msg["From"] = email_from
-        msg.attach(MIMEText(body_html, "html"))
-
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
-
-        print("Email enviado com sucesso (SMTP).")
-    except Exception as e:
-        print(f"Falha ao enviar email (SMTP): {e}")
-
-
-# ---------------- Pipeline ----------------
-def pipeline_meteo(ctx: dict):
-    mon = StepMonitor(ctx)
-    extra_lines: list[str] = []
-    handles: dict[str, dict] = {}
-    errors: dict[str, str] = {}
-
-    try:
-        data = request_data(ctx["api_url"])
-        mon.mark("Data request successful!")
-
-        received = receive_data(data)
-        mon.mark("Data reception successful!")
-
-        rows = parse_data(received)
-        if not rows:
-            raise ValueError("Parsing devolveu 0 linhas (verifica a API / parse).")
-        mon.mark(f"Parsing ({len(rows)} linhas)")
-
-        targets = load_db_targets(ctx)
-        mon.mark(f"Load DB targets ({len(targets)})")
-
-        mon.mark("Starting database accesses:")
-        handles, errors = connect_targets(targets, mon=mon)
-
-        extra_lines.append(f"Targets ligados: {', '.join(handles.keys()) if handles else '(nenhum)'}")
-        if errors:
-            extra_lines.append("Targets com erro: " + "; ".join([f"{k}={v}" for k, v in errors.items()]))
-
-        if not handles:
-            fp = offline_dump(rows)
-            mon.mark(f"Data saved to file `{fp}`")
-            return mon, extra_lines
-
-        # -------- DEDUPE + BATCHING --------
-        if DEDUP_MODE == "date":
-            batches = build_batches_by_fonte_day(rows)
-            mon.mark(f"Batching por fonte+dia ({len(batches)} batches)")
-
-            for target_name, h in handles.items():
-                inserted = 0
-                skipped = 0
-
-                for (fonte, day), batch_rows in batches.items():
-                    if h["type"] == "mongodb":
-                        exists = mongo_exists_day(h, fonte, day)
-                    else:
-                        exists = sql_exists_day(h, fonte, day)
-
-                    if exists:
-                        skipped += len(batch_rows)
-                        mon.mark(f"... `{day}` skipped for {fonte} @ {target_name} (dedup date)")
-                        continue
-
-                    if h["type"] == "mongodb":
-                        mongo_insert_many(h, batch_rows)
-                    else:
-                        sql_insert_many(h, batch_rows)
-
-                    inserted += len(batch_rows)
-                    mon.mark(f"... `{day}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
-
-                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
-
-        elif DEDUP_MODE in ("timestamp", "ts"):
-            batches = build_batches_by_fonte_ts(rows)
-            mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
-
-            for target_name, h in handles.items():
-                inserted = 0
-                skipped = 0
-
-                for (fonte, ts), batch_rows in batches.items():
-                    # normalize ts in rows
-                    for r in batch_rows:
-                        r["data"] = _ts_utc_naive(r.get("data"))
-
-                    # dedupe by (fonte, ts, lugar)
-                    if h["type"] == "mongodb":
-                        existing_lugares = mongo_existing_lugares_ts(h, fonte, ts)
-                    else:
-                        existing_lugares = sql_existing_lugares_ts(h, fonte, ts)
-
-                    to_insert = [r for r in batch_rows if str(r.get("lugar")) not in existing_lugares]
-                    skipped += (len(batch_rows) - len(to_insert))
-
-                    if not to_insert:
-                        mon.mark(f"... `{ts}` skipped for {fonte} @ {target_name} (dedup timestamp)")
-                        continue
-
-                    if h["type"] == "mongodb":
-                        mongo_insert_many(h, to_insert)
-                    else:
-                        sql_insert_many(h, to_insert)
-
-                    inserted += len(to_insert)
-                    mon.mark(f"... `{ts}` inserted {len(to_insert)} row(s) for {fonte} @ {target_name}")
-
-                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip={skipped}")
-
-        else:
-            # "none": always insert
-            batches = build_batches_by_fonte_ts(rows)
-            mon.mark(f"Batching por fonte+timestamp ({len(batches)} batches)")
-
-            for target_name, h in handles.items():
-                inserted = 0
-                for (fonte, ts), batch_rows in batches.items():
-                    for r in batch_rows:
-                        r["data"] = _ts_utc_naive(r.get("data"))
-
-                    if h["type"] == "mongodb":
-                        mongo_insert_many(h, batch_rows)
-                    else:
-                        sql_insert_many(h, batch_rows)
-
-                    inserted += len(batch_rows)
-                    mon.mark(f"... `{ts}` inserted {len(batch_rows)} row(s) for {fonte} @ {target_name}")
-
-                mon.mark(f"Write summary @ {target_name}: ins={inserted}, skip=0")
-
-    except Exception as e:
-        mon.mark(f"Erro: {e}", "FAIL")
-        extra_lines.append(f"Erro: {e}")
-
-    finally:
+    if resend_key:
         try:
-            close_targets(handles)
-            mon.mark("Fecho targets")
-        except Exception:
-            pass
+            payload = {"from": resend_from, "to": ctx["email_to"], "subject": subject, "html": body_html}
+            r = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=20,
+            )
+            r.raise_for_status()
+            print("Email enviado com sucesso (Resend).")
+            sent_ok = True
+        except Exception as e:
+            print(f"Falha ao enviar email via Resend: {e}")
 
-        send_summary_email(ctx, mon, extra_lines=extra_lines)
+    if not sent_ok:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["To"] = ", ".join(ctx["email_to"])
 
-        print(tabulate(
-            mon.pcp_rows_total(),
-            headers=[os.getenv("PIPELINE_PCP_HEADER") or f"Task(s) of {ctx['pipeline_name']} ({ctx['env']}).",
-                     "watch time (secs)", "proc time (secs)"]
-        ))
+            smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+            smtp_port = int(os.getenv("SMTP_PORT", "587"))
+            smtp_user = os.getenv("SMTP_USER")
+            smtp_pass = os.getenv("SMTP_PASS")
+            if not smtp_user or not smtp_pass:
+                raise RuntimeError("Faltam SMTP_USER / SMTP_PASS.")
 
-    return mon, extra_lines
+            email_from = os.getenv("PIPELINE_EMAIL_FROM") or smtp_user or ctx["email_from"]
+            msg["From"] = email_from
+            msg.attach(MIMEText(body_html, "html"))
 
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
 
-if __name__ == "__main__":
-    ctx = get_context()
-    print(f"Iniciando pipeline '{ctx['pipeline_name']}' (env={ctx['env']}, user={ctx['user']})...")
-    pipeline_meteo(ctx)
+            print("Email enviado com sucesso (SMTP).")
+        except Exception as e:
+            print(f"Falha ao enviar email (SMTP): {e}")
+
+    print("\n--- SUMÁRIO PCP (texto) ---\n")
+    print(table_txt)
