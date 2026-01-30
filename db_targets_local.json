@@ -1,7 +1,7 @@
 {
   "targets": [
-    { "name": "postgres_local", "type": "postgres", "dsn_env": "LOCAL_PG_DSN", "table": "meteo" },
-    { "name": "mariadb_local",  "type": "mysql",    "dsn_env": "LOCAL_MYSQL_DSN", "table": "meteo" },
+    { "name": "postgres_local", "type": "postgres", "dsn_env": "LOCAL_PG_DSN", "table": "meteo", "extras_column": "extras" },
+    { "name": "mariadb_local",  "type": "mysql",    "dsn_env": "LOCAL_MYSQL_DSN", "table": "meteo", "extras_column": "" },
     { "name": "mongodb",        "type": "mongodb",  "uri_env": "MONGO_URI", "database": "meteo", "collection": "meteo" }
   ]
 }
