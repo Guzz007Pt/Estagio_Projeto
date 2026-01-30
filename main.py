@@ -97,6 +97,10 @@ else:  # icao
 
 DASHBOARD_URL = os.getenv("PIPELINE_DASHBOARD_URL_METEO", "")
 
+
+SQL_EXTRAS_COLUMN_DEFAULT = (os.getenv("PIPELINE_SQL_EXTRAS_COLUMN") or "").strip()
+
+
 ctx = {
     "pipeline_name": PIPELINE_NAME,
     "env": PIPELINE_ENV,
@@ -195,8 +199,12 @@ try:
             "lugar": obs.get("city_name") or WEATHERBIT_CITY,
             "lat": obs.get("lat"),
             "lon": obs.get("lon"),
-            # extras opcional
-            # "extras": {"feels_like": obs.get("app_temp")}
+            "extras": {
+                "feels_like": obs.get("app_temp"),
+                "uv": obs.get("uv"),
+                "clouds": obs.get("clouds"),
+                "dewpt": obs.get("dewpt"),
+                },
         })
 
     elif API_PROVIDER == "ipma":
@@ -243,7 +251,7 @@ try:
                     "lugar": str(station_id),
                     "lat": None,
                     "lon": None,
-                    # "extras": {}
+                    "extras": {}
                 })
 
     elif API_PROVIDER == "icao":
@@ -338,8 +346,13 @@ try:
             "lugar": ICAO_CODE or item.get("icaoId") or item.get("station") or "UNKNOWN",
             "lat": item.get("lat") or item.get("latitude"),
             "lon": item.get("lon") or item.get("longitude"),
-            # extras opcional
-            # "extras": {"raw_metar": raw, "dewpoint_c": dew, "wind_dir": wind_dir, "wind_speed_kt": wind_kt}
+            "extras": {
+                "raw_metar": raw,
+                "dewpoint_c": dew,
+                "wind_dir": wind_dir,
+                "wind_speed_kt": wind_kt,
+            },
+
         })
 
     else:
@@ -355,6 +368,52 @@ try:
     w_prev = w_now
     p_prev = p_now
     steps.append({'step': str(f"Parsing ({len(rows)} linhas)"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
+    # =========================
+    # 3) Normalize timestamps (UTC naive, no microseconds)
+    # =========================
+    for r in rows:
+        v = r.get("data")
+        dt = None
+
+        if isinstance(v, datetime):
+            dt = v
+        elif isinstance(v, (int, float)):
+            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+        else:
+            s = str(v).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except Exception:
+                dt = None
+
+            if dt is None:
+                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                        break
+                    except Exception:
+                        continue
+
+            if dt is None:
+                dt = datetime.now(timezone.utc)
+
+        # garantir UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+
+        # DB compatibility (naive UTC)
+        r["data"] = dt.replace(tzinfo=None)
+
+    w_now = time.perf_counter()
+    p_now = time.process_time()
+    watch = w_now - w_prev
+    proc = p_now - p_prev
+    w_prev = w_now
+    p_prev = p_now
+    steps.append({'step': str("Normalize timestamps"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
 
     # =========================
@@ -388,12 +447,18 @@ try:
             table = (t.get("table") or "meteo").strip()
             if not table or not all(c.isalnum() or c == "_" for c in table):
                 raise ValueError(f"Nome de tabela inválido: {table!r}")
+            
+            extras_col = t.get("extras_column")
+            if extras_col is None:
+                extras_col = SQL_EXTRAS_COLUMN_DEFAULT
+            extras_col = (extras_col or "").strip()
 
             targets.append({
                 "name": name,
                 "type": "postgres" if ttype != "cratedb" else "cratedb",
                 "dsn": dsn,
-                "table": table
+                "table": table,
+                "extras_column": extras_col
             })
 
         elif ttype in ("mysql", "mariadb", "tidb", "tidbcloud"):
@@ -404,8 +469,13 @@ try:
             table = (t.get("table") or "meteo").strip()
             if not table or not all(c.isalnum() or c == "_" for c in table):
                 raise ValueError(f"Nome de tabela inválido: {table!r}")
+            
+            extras_col = t.get("extras_column")
+            if extras_col is None:
+                extras_col = SQL_EXTRAS_COLUMN_DEFAULT
+            extras_col = (extras_col or "").strip()
 
-            targets.append({"name": name, "type": "mysql", "dsn": dsn, "table": table})
+            targets.append({"name": name, "type": "mysql", "dsn": dsn, "table": table, "extras_column": extras_col})
 
         elif ttype in ("mongodb", "mongo"):
             uri = (t.get("uri") or "").strip()
@@ -451,7 +521,13 @@ try:
                 if not dsn:
                     raise RuntimeError("DSN vazio (dsn/dsn_env).")
                 conn = psycopg2.connect(dsn)
-                handles[name] = {"type": ttype, "conn": conn, "table": t["table"]}
+                handles[name] = {
+                    "type": ttype,
+                    "conn": conn,
+                    "table": t["table"],
+                    "extras_column": t.get("extras_column", "")
+                }
+
 
             elif ttype == "mysql":
                 dsn = (t.get("dsn") or "").strip()
@@ -481,7 +557,13 @@ try:
                 else:
                     raise RuntimeError("Instala pymysql ou mysql-connector-python para targets MySQL.")
 
-                handles[name] = {"type": "mysql", "conn": conn, "table": t["table"], "driver": driver}
+                handles[name] = {
+                    "type": "mysql",
+                    "conn": conn,
+                    "table": t["table"],
+                    "driver": driver,
+                    "extras_column": t.get("extras_column", "")
+                }
 
             elif ttype == "mongodb":
                 if not HAS_MONGO:
@@ -518,26 +600,7 @@ try:
     if errors:
         extra_lines.append("Targets com erro: " + "; ".join([f"{k}={v}" for k, v in errors.items()]))
 
-    # =========================
-    # 6) If no DB, offline CSV
-    # =========================
-    # if not handles:
-    #     os.makedirs("offline_output", exist_ok=True)
-    #     fp = f"offline_output/meteo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    #     with open(fp, "w", newline="", encoding="utf-8") as f:
-    #         w = csv.DictWriter(f, fieldnames=["fonte", "data", "temp", "humidade", "vento", "pressao", "precipitacao", "lugar", "lat", "lon"])
-    #         w.writeheader()
-    #         for r in rows:
-    #             w.writerow(r)
 
-    #     w_now = time.perf_counter()
-    #     p_now = time.process_time()
-    #     watch = w_now - w_prev
-    #     proc = p_now - p_prev
-    #     w_prev = w_now
-    #     p_prev = p_now
-    #     steps.append({'step': str(f"Data saved to file `{fp}`"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
-    #     extra_lines.append(f"Offline file: {fp}")
 
     # =========================
     # 7) Dedup + insert
@@ -616,13 +679,34 @@ try:
             else:
                 table = h["table"]
                 conn = h["conn"]
-                cols_sql = ", ".join(COLUMNS + ["regdata"])
-                ph = ", ".join(["%s"] * len(COLUMNS) + ["CURRENT_TIMESTAMP"])
+
+                extras_col = (h.get("extras_column") or "").strip()
+
+                if extras_col and not all(c.isalnum() or c == "_" for c in extras_col):
+                    raise ValueError(f"extras_column inválido: {extras_col!r}")
+
+                use_extras = bool(extras_col)
+
+                use_extras = bool(extras_col)
+
+                if use_extras:
+                    cols_sql = ", ".join(COLUMNS + [extras_col, "regdata"])
+                    ph = ", ".join(["%s"] * len(COLUMNS) + ["%s", "CURRENT_TIMESTAMP"])
+                else:
+                    cols_sql = ", ".join(COLUMNS + ["regdata"])
+                    ph = ", ".join(["%s"] * len(COLUMNS) + ["CURRENT_TIMESTAMP"])
+
                 insert_sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({ph})"
 
                 values = []
                 for r in to_insert:
-                    values.append(tuple(r.get(c) for c in COLUMNS))
+                    base = tuple(r.get(c) for c in COLUMNS)
+                    if use_extras:
+                        extras_json = json.dumps(r.get("extras") or {}, ensure_ascii=False)
+                        values.append(base + (extras_json,))
+                    else:
+                        values.append(base)
+
 
                 cur = conn.cursor()
                 try:

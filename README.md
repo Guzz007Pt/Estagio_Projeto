@@ -1,118 +1,73 @@
-# Estágio — Pipeline Meteorologia (v0.3.1)
+# Estágio — Pipeline Meteorologia (v0.4)
 
-Este repositório documenta a evolução de uma **pipeline de recolha de dados meteorológicos via REST API** e **persistência em base(s) de dados**, com foco em **rastreabilidade**, **portabilidade**, **redundância (fail‑safe)** e **execuções idempotentes**. fileciteturn14file0
+Pipeline para:
+- recolher dados meteorológicos via **REST API** (provider selecionado por `.env`)
+- normalizar para um **registo canónico (core)**
+- **deduplicar por timestamp** antes de inserir
+- persistir em **várias bases de dados** (Postgres/MySQL/CrateDB/MongoDB)
+- enviar **email de resumo** (Resend ou SMTP)
 
-A **v0.3.1** é uma iteração incremental sobre a v0.3, trazendo:
-- **Relatório “PCP-like”**: tempos **cumulativos** por etapa + *Overall*, alinhado com o estilo do orientador.
-- **Mensagens de ligação por target**: `Connecting...`, `... connected`, `... failed`, e resumo de escrita por target.
-- **SMTP externo (Gmail)**: envio de email via `smtp.gmail.com` com **App Password** (em vez de depender de `SMTP("localhost")`).
-- **Config mais clara de targets**: `type` + `dsn_env/uri_env` (segredos no `.env`, nada hardcoded).
+> Objetivo do projeto: **trocar APIs e DBs sem mexer no “core”**, apenas via configuração (`.env` + `db_targets.json`).  
 
 ---
 
 ## Índice
 
-- [O que mudou em v0.3.1](#o-que-mudou-em-v031)
-- [Fluxo da pipeline](#fluxo-da-pipeline)
+- [Arquitetura](#arquitetura)
 - [Requisitos](#requisitos)
 - [Instalação](#instalação)
 - [Configuração](#configuração)
   - [Variáveis de ambiente](#variáveis-de-ambiente)
   - [Ficheiro `db_targets.json`](#ficheiro-db_targetsjson)
 - [Como executar](#como-executar)
-- [Outputs](#outputs)
-  - [Inserção em BD](#inserção-em-bd)
-  - [Modo offline](#modo-offline)
-  - [Email de resumo](#email-de-resumo)
-  - [Relatório de execução (PCP-like)](#relatório-de-execução-pcp-like)
 - [Deduplicação](#deduplicação)
 - [Schema mínimo recomendado](#schema-mínimo-recomendado)
 - [Mapeamento de dados](#mapeamento-de-dados)
+- [Extensibilidade](#extensibilidade)
+  - [Adicionar uma nova BD (target)](#adicionar-uma-nova-bd-target)
+  - [Adicionar uma nova API (provider)](#adicionar-uma-nova-api-provider)
+  - [Adicionar colunas novas](#adicionar-colunas-novas)
+    - [Novo campo **extra** (opcional)](#novo-campo-extra-opcional)
+    - [Novo campo **core** (obrigatório)](#novo-campo-core-obrigatório)
 - [Troubleshooting](#troubleshooting)
-- [Próximos passos](#próximos-passos)
 
 ---
 
-## O que mudou em v0.3.1
-
-### ✅ Alterações principais
-- **Tempo cumulativo** por etapa (em vez de “tempo do passo”) + **Overall** no fim.
-- **Instrumentação por target**:
-  - `Connecting to \`<name>\``
-  - `... connected to \`<name>\``
-  - `... failed to connect to \`<name>\`: <erro>`
-  - `... <day> inserted ... @ <target>`
-  - `Write summary @ <target>: ins=<n>, skip=<n>`
-- **Email via SMTP externo (Gmail)** com credenciais via `.env` (App Password).
-- **Env toggles** para compatibilidade/local:
-  - `USE_CLTS_PCP=1` para usar `clts_pcp` (opcional).
-  - `PIPELINE_PCP_HEADER=...` para header idêntico ao PCP.
-
----
-
-## Fluxo da pipeline
+## Arquitetura
 
 ```mermaid
-flowchart LR
-  A["get_context()"] --> B["Request API<br/>(request_data)"]
-  B --> C["Receção/Validação JSON<br/>(receive_data)"]
-  C --> D["Parsing -> registos normalizados<br/>(parse_data)"]
-  D --> E["Load targets BD<br/>(load_db_targets)"]
-  E --> F["Connect targets<br/>(connect_targets)"]
-
-  F -->|0 ligações| G["Persistência offline<br/>(offline_dump -> CSV)"]
-  F -->|>=1 ligação| H["Batching por fonte+dia<br/>(build_batches_by_fonte_day)"]
-  H --> I["Dedup por dia (opcional)<br/>(*_exists_day)"]
-  I --> J["Inserção em lote<br/>(*_insert_many)"]
-
-  G --> K["Email c/ sumário<br/>(send_summary_email)"]
-  J --> K
-  K --> L["Fecho de ligações<br/>(close_targets)"]
+flowchart TD
+  A[Config (.env + db_targets.json)] --> B[Request API (provider)]
+  B --> C[Parse -> registo canónico (core)]
+  C --> D[Normalize timestamps (UTC, sem microseconds)]
+  D --> E[Load + connect targets]
+  E --> F[Batching por (fonte, timestamp)]
+  F --> G[Dedup por (fonte, data, lugar) em cada target]
+  G --> H[Insert (core + regdata + extras opcional)]
+  H --> I[Relatório PCP-like + Email]
 ```
 
 ---
 
 ## Requisitos
 
-- Python **3.10+** (recomendado)
-- Dependências típicas:
+- Python 3.10+
+- Dependências (conforme targets que usas):
   - `requests`
-  - `python-dotenv`
-  - `pandas`
-  - `tabulate`
-  - **Postgres/CrateDB**: `psycopg2-binary` (ou `psycopg2`)
-  - **MySQL/TiDB/MariaDB**: `pymysql` *(recomendado)* ou `mysql-connector-python`
-  - **MongoDB**: `pymongo`
-  - `clts-pcp` *(opcional — só se quiseres métricas PCP via lib)*
+  - `python-dotenv` (opcional)
+  - `psycopg2-binary` (Postgres / CrateDB via wire protocol)
+  - `pymysql` ou `mysql-connector-python` (MySQL/MariaDB/TiDB)
+  - `pymongo` (MongoDB)
+  - `tabulate` (opcional, para HTML/texto do relatório)
 
 ---
 
 ## Instalação
 
-### 1) Criar ambiente virtual
-```bash
-python -m venv .venv
-```
-
-**Windows (PowerShell):**
-```bash
-.\.venv\Scripts\Activate.ps1
-```
-
-**Linux/macOS:**
-```bash
-source .venv/bin/activate
-```
-
-### 2) Instalar dependências
-Se tiver `requirements.txt`:
 ```bash
 pip install -r requirements.txt
-```
-
-Se não existir (exemplo “full”):
-```bash
-pip install requests python-dotenv pandas tabulate psycopg2-binary pymongo pymysql
+# ou manual:
+pip install requests python-dotenv psycopg2-binary pymysql mysql-connector-python pymongo tabulate
 ```
 
 ---
@@ -121,261 +76,257 @@ pip install requests python-dotenv pandas tabulate psycopg2-binary pymongo pymys
 
 ### Variáveis de ambiente
 
-A pipeline lê variáveis via `.env` (com `python-dotenv`) e/ou variáveis do sistema.
+Recomendação para GitHub:
+- cria um `.env` local (não commit)
+- commita um `.env.example` com placeholders
 
-Cria um ficheiro `.env` na raiz do projeto (ao lado do `main.py`), por exemplo:
+Exemplo (mínimo funcional):
 
 ```env
-# contexto
-PIPELINE_USER=gustavo
+PIPELINE_NAME=GM-METEO
 PIPELINE_ENV=local
-PIPELINE_NAME=PCP-Meteo-v0.3.1
+PIPELINE_USER=gustavo
 
-# API (novo) - mantém compatibilidade com PIPELINE_API_URL_IPMA (antigo)
-PIPELINE_API_URL=
+# provider: weatherbit | ipma | icao
+PIPELINE_API_PROVIDER=icao
 
-# dedup (recomendado: date; para testar inserts: none)
-PIPELINE_DEDUP_MODE=date
+# só se provider=icao
+ICAO_CODE=LPPR
 
-# targets BD
+# targets
 PIPELINE_DB_TARGETS_FILE=db_targets.json
 
-# email (quem envia / quem recebe)
-PIPELINE_EMAIL_FROM=gustavomaquina.pipe@gmail.com
-PIPELINE_EMAIL_TO=pedro.pimenta@cm-maia.pt,gustavo.sa.martins@gmail.com
-PIPELINE_DASHBOARD_URL_METEO=
+# extras (opcional): nome da coluna SQL para JSON/texto com extras
+# deixa vazio se não queres extras por default em SQL
+PIPELINE_SQL_EXTRAS_COLUMN=extras
 
-# SMTP (Gmail)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=gustavomaquina.pipe@gmail.com
-SMTP_PASS=XXXX XXXX XXXX XXXX   # App Password (16 chars)
-
-# relatório PCP-like
-USE_CLTS_PCP=0
-PIPELINE_PCP_HEADER=
+# email (opcional)
+PIPELINE_EMAIL_FROM=estagio.pipeline@example.com
+PIPELINE_EMAIL_TO=you@example.com
 ```
 
-> ⚠️ **Nunca** comitar `.env` com segredos. Usa `.gitignore`.
+**Notas:**
+- `PIPELINE_API_PROVIDER` **não tem fallback**: se falhar, a execução falha (mensagem clara).
+- Se definires `PIPELINE_API_URL`, ele faz override ao URL automático do provider (útil para testes).
 
 ---
 
 ### Ficheiro `db_targets.json`
 
-A v0.3.1 suporta targets no formato:
-- uma lista `[...]`, ou
-- um objeto `{ "targets": [...] }`
-
-Campos recomendados por target:
-
-- `name`: identificador amigável
+O ficheiro indica **para onde escrever**. Cada target tem:
+- `name`: nome amigável
 - `type`: `postgres` | `mysql` | `cratedb` | `mongodb`
-- `enabled` (opcional): `true/false`
-- Para SQL: `table` (ex.: `"meteo"`)
-- Para Postgres/CrateDB/MySQL:
-  - `dsn_env` (recomendado) **ou** `dsn` (menos recomendado)
-- Para MongoDB:
-  - `uri_env` (recomendado) **ou** `uri`
-  - `database`
-  - `collection`
+- `dsn_env` / `uri_env`: nome da variável de ambiente com a credencial
+- `table` ou `database/collection`
+- `extras_column` (opcional): override por target (ex.: só alguns SQL aceitam extras)
 
-#### Exemplo completo (multi‑tipo)
+Exemplo:
 
 ```json
 {
   "targets": [
-    {
-      "name": "neon_pg",
-      "type": "postgres",
-      "enabled": true,
-      "table": "meteo",
-      "dsn_env": "NEON_DSN"
-    },
-    {
-      "name": "tidbcloud",
-      "type": "mysql",
-      "enabled": true,
-      "table": "meteo",
-      "dsn_env": "TIDB_DSN"
-    },
-    {
-      "name": "crate",
-      "type": "cratedb",
-      "enabled": false,
-      "table": "meteo",
-      "dsn_env": "CRATE_DSN"
-    },
-    {
-      "name": "mongo",
-      "type": "mongodb",
-      "enabled": true,
-      "uri_env": "MONGO_URI",
-      "database": "meteo",
-      "collection": "observations"
-    }
+    { "name": "cockroach", "type": "postgres", "dsn_env": "COCKROACH_DSN", "table": "meteo", "extras_column": "extras" },
+    { "name": "mariadb",   "type": "mysql",    "dsn_env": "MARIADB_DSN",   "table": "meteo", "extras_column": "" },
+    { "name": "mongodb",   "type": "mongodb",  "uri_env": "MONGO_URI",     "database": "meteo", "collection": "meteo" }
   ]
 }
 ```
 
-E no `.env`:
-
-```env
-NEON_DSN=postgresql://USER:PASS@HOST:5432/DB?sslmode=require
-TIDB_DSN=mysql://USER:PASS@HOST:4000/DB
-CRATE_DSN=postgresql://USER:PASS@HOST:5432/DB?sslmode=require
-MONGO_URI=mongodb+srv://USER:PASS@HOST/?retryWrites=true&w=majority
-```
-
-> Dica: para desativar um target sem apagar nada, usa `"enabled": false`.
+**Regra simples para extras em SQL:**
+- Se `extras_column` **for string vazia** → esse target **não recebe** extras.
+- Se `extras_column` não existir → usa o default `PIPELINE_SQL_EXTRAS_COLUMN`.
 
 ---
 
 ## Como executar
 
-Na raiz do projeto:
-
 ```bash
 python main.py
 ```
-
-O script:
-1. lê contexto,
-2. chama a API,
-3. normaliza os dados,
-4. lê `db_targets.json`,
-5. tenta ligar a todos os targets (com *fail‑safe*),
-6. faz *batching* e dedup (se ativo),
-7. escreve em 1+ bases (ou guarda CSV offline),
-8. envia email de resumo,
-9. fecha ligações.
-
-### Teste rápido: só email (sem correr o resto)
-```bash
-python -c "from main import get_context, StepMonitor, send_summary_email; ctx=get_context(); mon=StepMonitor(ctx); mon.mark('Local email test',seconds_override=0.2); send_summary_email(ctx, mon, extra_lines=['Hello from local test'])"
-```
-
----
-
-## Outputs
-
-### Inserção em BD
-
-A inserção usa um `INSERT` para a tabela `meteo` (ou equivalente), com subset mínimo:
-
-- `fonte`
-- `data`
-- `temp`
-- `humidade`
-- `vento`
-- `pressao`
-- `precipitacao`
-- `lugar`
-- `lat`
-- `lon`
-- `regdata = NOW()` *(quando aplicável)*
-
-### Modo offline
-
-Se **nenhuma BD** estiver acessível, é gerado um CSV em:
-
-- `offline_output/meteo_YYYYMMDD_HHMMSS.csv`
-
-### Email de resumo
-
-O email inclui:
-- identificação (pipeline/env/user),
-- opcionalmente link de dashboard (`PIPELINE_DASHBOARD_URL_METEO`),
-- tabela HTML com os passos e tempos cumulativos,
-- linhas extra (ex.: DBs ligadas e DBs com erro).
-
-Na v0.3.1, o envio é via **SMTP externo**:
-
-- host/port: `SMTP_HOST` / `SMTP_PORT`
-- auth: `SMTP_USER` + `SMTP_PASS` (**App Password** no caso do Gmail)
-
-### Relatório de execução (PCP-like)
-
-- Mostra **tempo cumulativo** por etapa (*watch* e *proc*).
-- Permite configurar o cabeçalho com `PIPELINE_PCP_HEADER`.
-- Por default usa `time.perf_counter()` / `time.process_time()` para evitar “tudo 0”.
-- Se quiseres usar `clts_pcp`, ativa `USE_CLTS_PCP=1`.
 
 ---
 
 ## Deduplicação
 
-Modo recomendado: `PIPELINE_DEDUP_MODE=date`
+A pipeline faz dedup **apenas por timestamp**, com esta lógica:
 
-- faz “exists check” por **(fonte, dia)** antes de inserir,
-- se existir, marca como `skipped (dedup)`.
+1. agrupa linhas por **(fonte, data)**  
+2. para cada target:
+   - busca os `lugar` já existentes para `(fonte, data)`
+   - insere apenas os `lugar` novos
 
-Para testes em que queres sempre inserir:
-```env
-PIPELINE_DEDUP_MODE=none
-```
+Isto torna a execução **idempotente** (re-executar não duplica), desde que:
+- o timestamp normalizado seja consistente (UTC, sem microseconds)
+- o `lugar` seja estável (ex.: estação / cidade / ICAO)
+
+> Dica: para máxima segurança contra concorrência, cria um índice/constraint UNIQUE em `(fonte, data, lugar)`.
 
 ---
 
 ## Schema mínimo recomendado
 
-Se precisares de criar rapidamente uma tabela compatível (mínimo):
+### Core (comum a todos)
+
+Campos usados no **core**:
+
+- `fonte` (texto)
+- `data` (timestamp)
+- `temp` (float)
+- `humidade` (float)
+- `vento` (float)
+- `pressao` (float)
+- `precipitacao` (float)
+- `lugar` (texto)
+- `lat` (float)
+- `lon` (float)
+- `regdata` (timestamp de inserção)
+
+### SQL (Postgres)
 
 ```sql
-CREATE TABLE IF NOT EXISTS meteo (
-  id SERIAL PRIMARY KEY,
-  fonte VARCHAR(30),
-  data TIMESTAMP,
-  temp REAL,
-  humidade REAL,
-  vento REAL,
-  pressao REAL,
-  precipitacao REAL,
-  lugar VARCHAR(80),
-  lat REAL,
-  lon REAL,
-  regdata TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE meteo (
+  fonte TEXT NOT NULL,
+  data  TIMESTAMP NOT NULL,
+  temp  DOUBLE PRECISION NULL,
+  humidade DOUBLE PRECISION NULL,
+  vento DOUBLE PRECISION NULL,
+  pressao DOUBLE PRECISION NULL,
+  precipitacao DOUBLE PRECISION NULL,
+  lugar TEXT NOT NULL,
+  lat DOUBLE PRECISION NULL,
+  lon DOUBLE PRECISION NULL,
+  extras JSONB NULL,
+  regdata TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (fonte, data, lugar)
 );
+```
+
+### SQL (MySQL/MariaDB)
+
+```sql
+CREATE TABLE meteo (
+  fonte VARCHAR(32) NOT NULL,
+  data  DATETIME NOT NULL,
+  temp DOUBLE NULL,
+  humidade DOUBLE NULL,
+  vento DOUBLE NULL,
+  pressao DOUBLE NULL,
+  precipitacao DOUBLE NULL,
+  lugar VARCHAR(128) NOT NULL,
+  lat DOUBLE NULL,
+  lon DOUBLE NULL,
+  extras JSON NULL,
+  regdata TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_meteo (fonte, data, lugar)
+);
+```
+
+> Se o teu MySQL não suportar `JSON`, usa `TEXT` e guarda `json.dumps(...)`.
+
+### MongoDB
+
+Sem schema fixo. Recomenda-se um índice:
+
+```js
+db.meteo.createIndex({ fonte: 1, data: 1, lugar: 1 }, { unique: true })
 ```
 
 ---
 
 ## Mapeamento de dados
 
-A pipeline normaliza várias fontes para um formato comum (mínimo):
+O parser converte a resposta da API num registo canónico:
 
-| Campo normalizado | Significado | Nota |
-|---|---|---|
-| `fonte` | origem (ex. `Weatherbit`, `IPMA`) | string |
-| `data` | timestamp/observação | `timestamp` |
-| `temp` | temperatura | pode vir `None` |
-| `humidade` | humidade relativa | pode vir `None` |
-| `vento` | intensidade do vento | pode vir `None` |
-| `pressao` | pressão | pode vir `None` |
-| `precipitacao` | precipitação | pode vir `None` |
-| `lugar` | identificador lógico | útil para dedup |
-| `lat/lon` | coordenadas | nem sempre disponíveis |
+| Campo core | Weatherbit | IPMA | ICAO/METAR |
+|---|---|---|---|
+| `temp` | `temp` | `temperatura` | `tempC` (ou parse do METAR) |
+| `humidade` | `rh` | `humidade` | calculada (temp/dewpoint) se possível |
+| `vento` | `wind_spd` | `intensidadeVento` | knots → m/s |
+| `pressao` | `pres` | `pressao` | `Q####` / `A####` |
+| `precipitacao` | `precip` | `precAcumulada` | (normalmente n/a) |
+| `lugar` | `city_name` | `station_id` | `ICAO_CODE` |
+
+---
+
+## Extensibilidade
+
+### Adicionar uma nova BD (target)
+
+1. **Adiciona um target** ao `db_targets.json`:
+   - define `type`, `dsn_env/uri_env`, `table`/`collection`
+2. **Cria a variável no `.env`** com o DSN/URI (ou mete no CI/Secrets).
+3. Garante que tens a lib instalada:
+   - Postgres/CrateDB → `psycopg2-binary`
+   - MySQL → `pymysql` ou `mysql-connector-python`
+   - MongoDB → `pymongo`
+
+> Não precisas alterar a lógica de dedup/insert: cada target segue o mesmo contrato (`type`, `conn/col`, `table`, etc.).
+
+---
+
+### Adicionar uma nova API (provider)
+
+O “contrato” do provider é: produzir uma lista `rows` onde cada item é um `dict` com os **campos core** (e `extras` opcional).
+
+Passos:
+
+1. **Config**
+   - adiciona o nome à whitelist: `PIPELINE_API_PROVIDER in ("weatherbit","ipma","icao","<novo>")`
+   - adiciona as variáveis necessárias no `.env` (ex.: `NEWPROVIDER_KEY`, `NEWPROVIDER_URL`)
+2. **Request**
+   - define o URL do novo provider (ou usa `PIPELINE_API_URL` como override)
+3. **Parse**
+   - cria um bloco `elif API_PROVIDER == "<novo>": ...`
+   - converte resposta em `rows.append({ ... })`
+
+Checklist rápido:
+- `data` deve ser `datetime` (idealmente UTC)
+- `lugar` deve existir e ser estável
+- se houver campos que só existem nesta API → mete em `r["extras"]`
+
+---
+
+### Adicionar colunas novas
+
+#### Novo campo extra (opcional)
+
+Ex.: queres `feels_like`, mas só o Weatherbit fornece.
+
+1. No parser, adiciona:
+   ```python
+   "extras": {"feels_like": obs.get("app_temp")}
+   ```
+2. Para SQL, garante que:
+   - a tabela tem uma coluna (`extras` ou outra)
+   - o target tem `extras_column` definido (ou `PIPELINE_SQL_EXTRAS_COLUMN` global)
+3. Para MongoDB, não precisas de schema: `extras` fica no documento.
+
+**Vantagem:** não mexes no core nem em todas as DBs — só os targets que suportam extras guardam.
+
+---
+
+#### Novo campo core (obrigatório)
+
+Ex.: queres adicionar `uv_index` como campo “obrigatório”.
+
+Checklist (tens de atualizar tudo o que “assume” o core):
+
+1. **Parser**: o novo campo tem de existir em **todas** as APIs (ou ter fallback/valor `None`).
+2. **COLUMNS**: adiciona o nome na lista de colunas core usada no insert.
+3. **Schema SQL**: adiciona coluna na tabela (em todas as DBs SQL usadas).
+4. **MongoDB**: sem schema obrigatório, mas convém manter consistência.
+
+> Regra prática: se só algumas fontes têm o campo → **extras**.  
+> Se queres mesmo tornar “core” → tens de garantir compatibilidade em todas as fontes/targets.
 
 ---
 
 ## Troubleshooting
 
-### `getaddrinfo failed`
-- Normalmente `SMTP_HOST` ou `DB host` mal preenchido.
-- Para Gmail, `SMTP_HOST` tem de ser **`smtp.gmail.com`** (não é email).
-
-### `535 Username and Password not accepted`
-- Estás a usar a password normal do Gmail.
-- Tens de usar **App Password** (com 2FA ativo).
-
-### “Falha a ligar” com `HOST` / `host`
-- O DSN/URI está com placeholders.
-- Preenche o `dsn_env` e define a env var no `.env`.
+- **SecretNotFoundError no Colab**: acontece se fizeres `userdata.get("X")` para um secret que não existe.  
+  Solução: envolve com `try/except` ou só chama `userdata.get()` se souberes que está definido.
+- **“Resposta <provider> inesperada”**: o provider está certo mas o formato mudou → revê o bloco de parse desse provider.
+- **Problemas de timestamp/dedup**: confirma que `data` está a ser normalizado para UTC e sem microseconds.
 
 ---
 
-## Próximos passos
-
-- Normalizar suporte SSL/TLS para MySQL/TiDB (ex.: `ssl_ca` via env).
-- Melhorar idempotência (ex.: `UNIQUE` + `ON CONFLICT DO NOTHING` / upserts).
-- Logging estruturado (níveis, timestamps, correlation id por execução).
-- Automatizar validação de `db_targets.json` (schema + sanity checks).
