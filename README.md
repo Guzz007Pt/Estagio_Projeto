@@ -7,8 +7,6 @@ Pipeline para:
 - persistir em **várias bases de dados** (Postgres/MySQL/CrateDB/MongoDB)
 - enviar **email de resumo** (Resend ou SMTP)
 
-> Objetivo do projeto: **trocar APIs e DBs sem mexer no “core”**, apenas via configuração (`.env` + `db_targets.json`).  
-
 ---
 
 ## Índice
