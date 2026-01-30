@@ -66,11 +66,34 @@ EMAIL_TO_DEFAULT = [
 DB_TARGETS_FILE = os.getenv("PIPELINE_DB_TARGETS_FILE", "db_targets.json")
 
 
-WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "")
+API_PROVIDER = (os.getenv("PIPELINE_API_PROVIDER") or "").strip().lower()
+if API_PROVIDER not in ("weatherbit", "ipma", "icao"):
+    raise ValueError("Define PIPELINE_API_PROVIDER em .env: weatherbit | ipma | icao")
+
+WEATHERBIT_KEY = os.getenv("WEATHERBIT_API_KEY", "").strip()
 WEATHERBIT_CITY = os.getenv("WEATHERBIT_CITY", "Maia,PT")
 WEATHERBIT_URL = f"https://api.weatherbit.io/v2.0/current?city={WEATHERBIT_CITY}&key={WEATHERBIT_KEY}"
+
 IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
-API_URL = os.getenv("PIPELINE_API_URL", WEATHERBIT_URL if WEATHERBIT_KEY else IPMA_URL)
+
+ICAO_CODE = (os.getenv("ICAO_CODE") or "").strip().upper()
+ICAO_URL = f"https://aviationweather.gov/api/data/metar?ids={ICAO_CODE}&format=json"
+
+API_URL_OVERRIDE = (os.getenv("PIPELINE_API_URL") or "").strip()
+
+if API_PROVIDER == "weatherbit":
+    if not WEATHERBIT_KEY:
+        raise ValueError("PIPELINE_API_PROVIDER=weatherbit mas falta WEATHERBIT_API_KEY")
+    API_URL = API_URL_OVERRIDE or WEATHERBIT_URL
+
+elif API_PROVIDER == "ipma":
+    API_URL = API_URL_OVERRIDE or IPMA_URL
+
+else:  # icao
+    if not ICAO_CODE:
+        raise ValueError("PIPELINE_API_PROVIDER=icao mas falta ICAO_CODE (ex: LPPR)")
+    API_URL = API_URL_OVERRIDE or ICAO_URL
+
 
 DASHBOARD_URL = os.getenv("PIPELINE_DASHBOARD_URL_METEO", "")
 
@@ -83,6 +106,9 @@ ctx = {
     "email_to": EMAIL_TO_DEFAULT,
     "dashboard_url": DASHBOARD_URL,
     "db_targets_file": DB_TARGETS_FILE,
+    "api_provider": API_PROVIDER,
+    "icao_code": ICAO_CODE,
+
 }
 
 print(f"Iniciando pipeline '{ctx['pipeline_name']}' (env={ctx['env']}, user={ctx['user']})...")
@@ -132,8 +158,10 @@ try:
     # =========================
     rows = []
 
-    # Weatherbit shape: {"data":[{...}]}
-    if isinstance(received, dict) and "data" in received and isinstance(received["data"], list) and received["data"]:
+    if API_PROVIDER == "weatherbit":
+        if not (isinstance(received, dict) and "data" in received and isinstance(received["data"], list) and received["data"]):
+            raise ValueError("Resposta Weatherbit inesperada (esperado dict com 'data':[...]).")
+
         obs = received["data"][0]
 
         # Parse timestamp
@@ -167,52 +195,155 @@ try:
             "lugar": obs.get("city_name") or WEATHERBIT_CITY,
             "lat": obs.get("lat"),
             "lon": obs.get("lon"),
+            # extras opcional
+            # "extras": {"feels_like": obs.get("app_temp")}
         })
 
-    # IPMA shape: { "<timestamp>": { "<station_id>": {...}, ... }, ... }
-    else:
-        if isinstance(received, dict):
-            for timestamp, stations in received.items():
-                if not isinstance(stations, dict):
-                    continue
+    elif API_PROVIDER == "ipma":
+        if not isinstance(received, dict):
+            raise ValueError("Resposta IPMA inesperada (esperado dict {timestamp:{station:{...}}}).")
 
-                # parse timestamp key
+        for timestamp, stations in received.items():
+            if not isinstance(stations, dict):
+                continue
+
+            # parse timestamp key
+            ts_dt = None
+            s = str(timestamp).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+
+            try:
+                ts_dt = datetime.fromisoformat(s)
+            except Exception:
                 ts_dt = None
-                s = str(timestamp).strip()
+
+            if ts_dt is None:
+                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        ts_dt = datetime.strptime(str(timestamp).strip(), fmt).replace(tzinfo=timezone.utc)
+                        break
+                    except Exception:
+                        continue
+
+            if ts_dt is None:
+                ts_dt = datetime.now(timezone.utc)
+
+            for station_id, values in stations.items():
+                if not isinstance(values, dict):
+                    continue
+                rows.append({
+                    "fonte": "IPMA",
+                    "data": ts_dt,
+                    "temp": values.get("temperatura"),
+                    "humidade": values.get("humidade"),
+                    "vento": values.get("intensidadeVento"),
+                    "pressao": values.get("pressao"),
+                    "precipitacao": values.get("precAcumulada"),
+                    "lugar": str(station_id),
+                    "lat": None,
+                    "lon": None,
+                    # "extras": {}
+                })
+
+    elif API_PROVIDER == "icao":
+        # AWC METAR normalmente retorna LISTA de dicts
+        item = None
+        if isinstance(received, list) and received and isinstance(received[0], dict):
+            item = received[0]
+        elif isinstance(received, dict):
+            item = received
+
+        if not isinstance(item, dict):
+            raise ValueError("Resposta ICAO inesperada (esperado list[dict] ou dict).")
+
+        raw = (item.get("rawOb") or item.get("raw") or item.get("metar") or "").strip()
+
+        # timestamp best-effort
+        dt = None
+        for k in ("obsTime", "reportTime", "validTime", "time"):
+            v = item.get(k)
+            if v:
+                s = str(v).strip()
                 if s.endswith("Z"):
                     s = s[:-1] + "+00:00"
-
                 try:
-                    ts_dt = datetime.fromisoformat(s)
+                    dt = datetime.fromisoformat(s)
+                    break
                 except Exception:
-                    ts_dt = None
+                    dt = None
+        if dt is None:
+            dt = datetime.now(timezone.utc)
 
-                if ts_dt is None:
-                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-                        try:
-                            ts_dt = datetime.strptime(str(timestamp).strip(), fmt).replace(tzinfo=timezone.utc)
-                            break
-                        except Exception:
-                            continue
+        # temp / dewpoint best-effort
+        temp = item.get("tempC") if item.get("tempC") is not None else item.get("temp")
+        dew = item.get("dewpointC") if item.get("dewpointC") is not None else item.get("dewp")
 
-                if ts_dt is None:
-                    ts_dt = datetime.now(timezone.utc)
+        import re
+        if (temp is None or dew is None) and raw:
+            m = re.search(r"\b(M?\d{2})/(M?\d{2})\b", raw)
+            if m:
+                def _t(x):
+                    return -int(x[1:]) if x.startswith("M") else int(x)
+                if temp is None:
+                    temp = _t(m.group(1))
+                if dew is None:
+                    dew = _t(m.group(2))
 
-                for station_id, values in stations.items():
-                    if not isinstance(values, dict):
-                        continue
-                    rows.append({
-                        "fonte": "IPMA",
-                        "data": ts_dt,
-                        "temp": values.get("temperatura"),
-                        "humidade": values.get("humidade"),
-                        "vento": values.get("intensidadeVento"),
-                        "pressao": values.get("pressao"),
-                        "precipitacao": values.get("precAcumulada"),
-                        "lugar": str(station_id),
-                        "lat": None,
-                        "lon": None,
-                    })
+        # wind best-effort (knots -> m/s)
+        wind_dir = item.get("wdir")
+        wind_kt = item.get("wspd") if item.get("wspd") is not None else item.get("windSpeedKt")
+        if wind_kt is None and raw:
+            m = re.search(r"\b(\d{3}|VRB)(\d{2,3})KT\b", raw)
+            if m:
+                wind_dir = None if m.group(1) == "VRB" else int(m.group(1))
+                wind_kt = int(m.group(2))
+
+        wind_ms = None
+        if wind_kt is not None:
+            try:
+                wind_ms = float(wind_kt) * 0.514444
+            except Exception:
+                wind_ms = None
+
+        # pressure best-effort: Q1013 or A2992
+        press_hpa = None
+        if raw:
+            mq = re.search(r"\bQ(\d{4})\b", raw)
+            if mq:
+                press_hpa = float(mq.group(1))
+            ma = re.search(r"\bA(\d{4})\b", raw)
+            if press_hpa is None and ma:
+                press_hpa = (float(ma.group(1)) / 100.0) * 33.8638866667
+
+        # humidity from temp + dewpoint (optional)
+        hum = None
+        if temp is not None and dew is not None:
+            try:
+                import math
+                es = math.exp((17.625 * float(dew)) / (243.04 + float(dew)))
+                et = math.exp((17.625 * float(temp)) / (243.04 + float(temp)))
+                hum = round(100.0 * (es / et), 1)
+            except Exception:
+                hum = None
+
+        rows.append({
+            "fonte": "ICAO",
+            "data": dt,
+            "temp": temp,
+            "humidade": hum,
+            "vento": wind_ms,
+            "pressao": press_hpa,
+            "precipitacao": None,
+            "lugar": ICAO_CODE or item.get("icaoId") or item.get("station") or "UNKNOWN",
+            "lat": item.get("lat") or item.get("latitude"),
+            "lon": item.get("lon") or item.get("longitude"),
+            # extras opcional
+            # "extras": {"raw_metar": raw, "dewpoint_c": dew, "wind_dir": wind_dir, "wind_speed_kt": wind_kt}
+        })
+
+    else:
+        raise ValueError(f"API_PROVIDER inválido: {API_PROVIDER!r}")
 
     if not rows:
         raise ValueError("Parsing devolveu 0 linhas (verifica a API / parse).")
@@ -225,47 +356,6 @@ try:
     p_prev = p_now
     steps.append({'step': str(f"Parsing ({len(rows)} linhas)"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
-    # =========================
-    # 3) Normalize timestamps (UTC naive, no microseconds)
-    # =========================
-    for r in rows:
-        v = r.get("data")
-        dt = None
-
-        if isinstance(v, datetime):
-            dt = v
-        elif isinstance(v, (int, float)):
-            dt = datetime.fromtimestamp(v, tz=timezone.utc)
-        else:
-            s = str(v).strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                dt = datetime.fromisoformat(s)
-            except Exception:
-                dt = None
-            if dt is None:
-                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-                    try:
-                        dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-                        break
-                    except Exception:
-                        continue
-            if dt is None:
-                dt = datetime.now(timezone.utc)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc).replace(microsecond=0)
-        r["data"] = dt.replace(tzinfo=None)  # naive UTC for DB compatibility
-
-    w_now = time.perf_counter()
-    p_now = time.process_time()
-    watch = w_now - w_prev
-    proc = p_now - p_prev
-    w_prev = w_now
-    p_prev = p_now
-    steps.append({'step': str("Normalize timestamps"), 'status': str(''), 'watch': float(watch), 'proc': float(proc)})
 
     # =========================
     # 4) Load DB targets

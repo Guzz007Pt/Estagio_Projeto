@@ -37,6 +37,8 @@ offline_output/
 *.key
 db_targets.json
 
+!.env.example
+
 # =========================
 # IDE / OS files
 # =========================
