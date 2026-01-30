@@ -219,8 +219,6 @@ CREATE TABLE meteo (
 );
 ```
 
-> Se MySQL não suportar `JSON`, usa `TEXT` e guarda `json.dumps(...)`.
-
 ### MongoDB
 
 Sem schema fixo. Recomenda-se um índice:
