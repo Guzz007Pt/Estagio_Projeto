@@ -35,14 +35,14 @@ Pipeline para:
 
 ```mermaid
 flowchart TD
-  A[Config (.env + db_targets.json)] --> B[Request API (provider)]
-  B --> C[Parse -> registo canónico (core)]
-  C --> D[Normalize timestamps (UTC, sem microseconds)]
-  D --> E[Load + connect targets]
-  E --> F[Batching por (fonte, timestamp)]
-  F --> G[Dedup por (fonte, data, lugar) em cada target]
-  G --> H[Insert (core + regdata + extras opcional)]
-  H --> I[Relatório PCP-like + Email]
+  A["Config<br/>.env + db_targets.json"] --> B["Request API<br/>provider selecionado"]
+  B --> C["Parse<br/>registo canónico (core)"]
+  C --> D["Normalize timestamps<br/>UTC, sem microseconds"]
+  D --> E["Load + connect targets"]
+  E --> F["Batching<br/>(fonte, timestamp)"]
+  F --> G["Dedup<br/>(fonte, data, lugar) por target"]
+  G --> H["Insert<br/>core + regdata + extras opcional"]
+  H --> I["Relatório PCP-like + Email"]
 ```
 
 ---
@@ -50,7 +50,7 @@ flowchart TD
 ## Requisitos
 
 - Python 3.10+
-- Dependências (conforme targets que usas):
+- Dependências (conforme targets que são usados):
   - `requests`
   - `python-dotenv` (opcional)
   - `psycopg2-binary` (Postgres / CrateDB via wire protocol)
@@ -75,8 +75,8 @@ pip install requests python-dotenv psycopg2-binary pymysql mysql-connector-pytho
 ### Variáveis de ambiente
 
 Recomendação para GitHub:
-- cria um `.env` local (não commit)
-- commita um `.env.example` com placeholders
+- criar um `.env` local (não commit)
+- dar commit a um `.env.example` com placeholders
 
 Exemplo (mínimo funcional):
 
@@ -95,7 +95,7 @@ ICAO_CODE=LPPR
 PIPELINE_DB_TARGETS_FILE=db_targets.json
 
 # extras (opcional): nome da coluna SQL para JSON/texto com extras
-# deixa vazio se não queres extras por default em SQL
+# deixar vazio se não quer extras por default em SQL
 PIPELINE_SQL_EXTRAS_COLUMN=extras
 
 # email (opcional)
@@ -104,15 +104,15 @@ PIPELINE_EMAIL_TO=you@example.com
 ```
 
 **Notas:**
-- `PIPELINE_API_PROVIDER` **não tem fallback**: se falhar, a execução falha (mensagem clara).
-- Se definires `PIPELINE_API_URL`, ele faz override ao URL automático do provider (útil para testes).
+- `PIPELINE_API_PROVIDER` **não tem fallback**: se falhar, a execução falha.
+- Se for definido `PIPELINE_API_URL`, ele faz override ao URL automático do provider (útil para testes).
 
 ---
 
 ### Ficheiro `db_targets.json`
 
 O ficheiro indica **para onde escrever**. Cada target tem:
-- `name`: nome amigável
+- `name`: nome 
 - `type`: `postgres` | `mysql` | `cratedb` | `mongodb`
 - `dsn_env` / `uri_env`: nome da variável de ambiente com a credencial
 - `table` ou `database/collection`
@@ -132,7 +132,7 @@ Exemplo:
 
 **Regra simples para extras em SQL:**
 - Se `extras_column` **for string vazia** → esse target **não recebe** extras.
-- Se `extras_column` não existir → usa o default `PIPELINE_SQL_EXTRAS_COLUMN`.
+- Se `extras_column` não existir → usar o default `PIPELINE_SQL_EXTRAS_COLUMN`.
 
 ---
 
@@ -157,11 +157,11 @@ Isto torna a execução **idempotente** (re-executar não duplica), desde que:
 - o timestamp normalizado seja consistente (UTC, sem microseconds)
 - o `lugar` seja estável (ex.: estação / cidade / ICAO)
 
-> Dica: para máxima segurança contra concorrência, cria um índice/constraint UNIQUE em `(fonte, data, lugar)`.
+> Dica: para segurança contra concorrência, criar um índice/constraint UNIQUE em `(fonte, data, lugar)`.
 
 ---
 
-## Schema mínimo recomendado
+## Schema mínimo recomendado (meteorologia)
 
 ### Core (comum a todos)
 
@@ -179,7 +179,7 @@ Campos usados no **core**:
 - `lon` (float)
 - `regdata` (timestamp de inserção)
 
-### SQL (Postgres)
+### SQL (Postgres) 
 
 ```sql
 CREATE TABLE meteo (
@@ -219,7 +219,7 @@ CREATE TABLE meteo (
 );
 ```
 
-> Se o teu MySQL não suportar `JSON`, usa `TEXT` e guarda `json.dumps(...)`.
+> Se MySQL não suportar `JSON`, usa `TEXT` e guarda `json.dumps(...)`.
 
 ### MongoDB
 
@@ -250,15 +250,15 @@ O parser converte a resposta da API num registo canónico:
 
 ### Adicionar uma nova BD (target)
 
-1. **Adiciona um target** ao `db_targets.json`:
-   - define `type`, `dsn_env/uri_env`, `table`/`collection`
-2. **Cria a variável no `.env`** com o DSN/URI (ou mete no CI/Secrets).
-3. Garante que tens a lib instalada:
+1. **Adicionar um target** ao `db_targets.json`:
+   - definir `type`, `dsn_env/uri_env`, `table`/`collection`
+2. **Criar a variável no `.env`** com o DSN/URI (ou mete no CI/Secrets).
+3. Garantir que a lib está instalada:
    - Postgres/CrateDB → `psycopg2-binary`
    - MySQL → `pymysql` ou `mysql-connector-python`
    - MongoDB → `pymongo`
 
-> Não precisas alterar a lógica de dedup/insert: cada target segue o mesmo contrato (`type`, `conn/col`, `table`, etc.).
+> Não é preciso alterar a lógica de dedup/insert: cada target segue o mesmo contrato (`type`, `conn/col`, `table`, etc.).
 
 ---
 
@@ -269,18 +269,18 @@ O “contrato” do provider é: produzir uma lista `rows` onde cada item é um 
 Passos:
 
 1. **Config**
-   - adiciona o nome à whitelist: `PIPELINE_API_PROVIDER in ("weatherbit","ipma","icao","<novo>")`
-   - adiciona as variáveis necessárias no `.env` (ex.: `NEWPROVIDER_KEY`, `NEWPROVIDER_URL`)
+   - adicionar o nome à whitelist: `PIPELINE_API_PROVIDER in ("weatherbit","ipma","icao","<novo>")`
+   - adicionar as variáveis necessárias no `.env` (ex.: `NEWPROVIDER_KEY`, `NEWPROVIDER_URL`)
 2. **Request**
-   - define o URL do novo provider (ou usa `PIPELINE_API_URL` como override)
+   - definir o URL do novo provider (ou usa `PIPELINE_API_URL` como override)
 3. **Parse**
-   - cria um bloco `elif API_PROVIDER == "<novo>": ...`
-   - converte resposta em `rows.append({ ... })`
+   - criar um bloco `elif API_PROVIDER == "<novo>": ...`
+   - converter resposta em `rows.append({ ... })`
 
 Checklist rápido:
 - `data` deve ser `datetime` (idealmente UTC)
 - `lugar` deve existir e ser estável
-- se houver campos que só existem nesta API → mete em `r["extras"]`
+- se houver campos que só existem nesta API → meter em `r["extras"]`
 
 ---
 
@@ -288,43 +288,43 @@ Checklist rápido:
 
 #### Novo campo extra (opcional)
 
-Ex.: queres `feels_like`, mas só o Weatherbit fornece.
+Ex.: quer `feels_like`, mas só o Weatherbit fornece.
 
-1. No parser, adiciona:
+1. No parser, adiciona-se:
    ```python
    "extras": {"feels_like": obs.get("app_temp")}
    ```
-2. Para SQL, garante que:
+2. Para SQL, garante-se que:
    - a tabela tem uma coluna (`extras` ou outra)
    - o target tem `extras_column` definido (ou `PIPELINE_SQL_EXTRAS_COLUMN` global)
-3. Para MongoDB, não precisas de schema: `extras` fica no documento.
+3. Para MongoDB, não é preciso schema: `extras` fica no documento.
 
-**Vantagem:** não mexes no core nem em todas as DBs — só os targets que suportam extras guardam.
+**Vantagem:** não se mexe no core nem em todas as DBs — só os targets que suportam extras guardam.
 
 ---
 
 #### Novo campo core (obrigatório)
 
-Ex.: queres adicionar `uv_index` como campo “obrigatório”.
+Ex.: quer adicionar `uv_index` como campo “obrigatório”.
 
-Checklist (tens de atualizar tudo o que “assume” o core):
+Checklist (tem de atualizar tudo o que “assume” o core):
 
 1. **Parser**: o novo campo tem de existir em **todas** as APIs (ou ter fallback/valor `None`).
-2. **COLUMNS**: adiciona o nome na lista de colunas core usada no insert.
-3. **Schema SQL**: adiciona coluna na tabela (em todas as DBs SQL usadas).
+2. **COLUMNS**: adicionar o nome na lista de colunas core usada no insert.
+3. **Schema SQL**: adicionar coluna na tabela (em todas as DBs SQL usadas).
 4. **MongoDB**: sem schema obrigatório, mas convém manter consistência.
 
 > Regra prática: se só algumas fontes têm o campo → **extras**.  
-> Se queres mesmo tornar “core” → tens de garantir compatibilidade em todas as fontes/targets.
+> Se quer mesmo tornar “core” → tem de ser garantida a compatibilidade em todas as fontes/targets.
 
 ---
 
 ## Troubleshooting
 
-- **SecretNotFoundError no Colab**: acontece se fizeres `userdata.get("X")` para um secret que não existe.  
-  Solução: envolve com `try/except` ou só chama `userdata.get()` se souberes que está definido.
-- **“Resposta <provider> inesperada”**: o provider está certo mas o formato mudou → revê o bloco de parse desse provider.
-- **Problemas de timestamp/dedup**: confirma que `data` está a ser normalizado para UTC e sem microseconds.
+- **SecretNotFoundError no Colab**: pode acontecer se fizer `userdata.get("X")` para um secret que não existe.  
+  Solução: envolver com `try/except` ou só chamar `userdata.get()` se tiver a certeza que está definido.
+- **“Resposta <provider> inesperada”**: o provider está certo mas o formato mudou → rever o bloco de parse desse provider.
+- **Problemas de timestamp/dedup**: confirmar que `data` está a ser normalizado para UTC e sem microseconds.
 
 ---
 
